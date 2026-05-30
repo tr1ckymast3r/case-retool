@@ -1,0 +1,738 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🔍 ReTool — Phân Tích Phần Mềm Đối Thủ</title>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background: #0f172a; }
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #1e293b; }
+        ::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
+        .drop-zone-active { border-color: #6366f1 !important; background: rgba(99,102,241,0.1) !important; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .spinner { animation: spin 1s linear infinite; }
+        @keyframes fadeIn { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }
+        .fade-in { animation: fadeIn 0.3s ease-out; }
+    </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useCallback, useRef } = React;
+
+// ── API helper ──
+const api = {
+  get: (url) => fetch(url).then(r => r.json()),
+  post: (url, body) => fetch(url, { method:'POST', body }).then(r => r.json()),
+  delete: (url) => fetch(url, { method:'DELETE' }).then(r => r.json()),
+};
+
+// ── Simple markdown renderer ──
+function renderMarkdown(md) {
+  if (!md) return '';
+  let html = md
+    .replace(/^### (.+)$/gm, '<h3 class="text-lg font-bold text-indigo-400 mt-4 mb-2">$1</h3>')
+    .replace(/^## (.+)$/gm, '<h2 class="text-xl font-bold text-indigo-300 mt-6 mb-3">$1</h2>')
+    .replace(/^# (.+)$/gm, '<h1 class="text-2xl font-bold text-indigo-200 mt-6 mb-3">$1</h1>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong class="text-white">$1</strong>')
+    .replace(/\*(.+?)\*/g, '<em class="text-slate-300">$1</em>')
+    .replace(/^- (.+)$/gm, '<li class="ml-4 text-slate-300">$1</li>')
+    .replace(/^(\d+)\. (.+)$/gm, '<li class="ml-4 text-slate-300">$2</li>')
+    .replace(/`(.+?)`/g, '<code class="bg-slate-700 px-1 rounded text-indigo-300">$1</code>')
+    .replace(/\n\n/g, '<br/><br/>');
+  html = html.replace(/(<li.*<\/li>)/s, '<ul class="list-disc mb-2">$1</ul>');
+  return html;
+}
+
+// ── Toast System ──
+let toastId = 0;
+function ToastContainer({ toasts, remove }) {
+  return (
+    <div className="fixed top-4 right-4 z-50 flex flex-col gap-2">
+      {toasts.map(t => (
+        <div key={t.id} className={`fade-in px-4 py-3 rounded-lg shadow-lg text-sm font-medium flex items-center gap-2 ${
+          t.type==='success' ? 'bg-green-600 text-white' : t.type==='error' ? 'bg-red-600 text-white' : 'bg-indigo-600 text-white'
+        }`} onClick={() => remove(t.id)}>
+          {t.type==='success' ? '✅' : t.type==='error' ? '❌' : 'ℹ️'} {t.msg}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── Loading Spinner ──
+function Spinner({ size = 'md' }) {
+  const s = size==='sm' ? 'h-5 w-5' : size==='lg' ? 'h-12 w-12' : 'h-8 w-8';
+  return (
+    <div className="flex justify-center items-center py-8">
+      <div className={`spinner rounded-full border-2 border-slate-600 border-t-indigo-500 ${s}`}></div>
+    </div>
+  );
+}
+
+// ── Badge helpers ──
+const statusBadge = (s) => {
+  const map = { queued:'bg-gray-500', analyzing:'bg-yellow-500', completed:'bg-green-500', failed:'bg-red-500' };
+  const label = { queued:'Chờ xử lý', analyzing:'Đang phân tích', completed:'Hoàn thành', failed:'Lỗi' };
+  return <span className={`px-2 py-0.5 rounded-full text-xs font-medium text-white ${map[s]||'bg-gray-500'}`}>{label[s]||s}</span>;
+};
+
+const fileBadge = (ft) => {
+  const map = { PE:'bg-blue-600', ELF:'bg-orange-600', APK:'bg-green-600', DEB:'bg-orange-500', DMG:'bg-slate-500', IPA:'bg-purple-600', MSI:'bg-blue-500', EXE:'bg-blue-600', DLL:'bg-cyan-600', SO:'bg-orange-600' };
+  return <span className={`px-2 py-0.5 rounded text-xs font-mono font-bold text-white ${map[ft]||'bg-slate-600'}`}>{ft||'—'}</span>;
+};
+
+const platformIcon = (p) => {
+  const map = { linux:'🐧', windows:'🪟', android:'🤖', ios:'🍎', macos:'🍏' };
+  return map[(p||'').toLowerCase()] || '💻';
+};
+
+// ── Sidebar ──
+function Sidebar({ page, nav }) {
+  const items = [
+    { id:'dashboard', icon:'📊', label:'Bảng điều khiển' },
+    { id:'upload', icon:'📤', label:'Phân tích mới' },
+  ];
+  return (
+    <aside className="w-64 bg-slate-800 border-r border-slate-700 flex flex-col min-h-screen">
+      <div className="p-4 border-b border-slate-700">
+        <h1 className="text-lg font-bold text-white">🔍 ReTool</h1>
+        <p className="text-xs text-slate-400">Phân Tích Phần Mềm Đối Thủ</p>
+      </div>
+      <nav className="flex-1 p-2">
+        {items.map(i => (
+          <button key={i.id} onClick={() => nav(i.id)} className={`w-full text-left px-4 py-3 rounded-lg mb-1 flex items-center gap-3 transition-colors ${page===i.id ? 'bg-indigo-600 text-white' : 'text-slate-300 hover:bg-slate-700'}`}>
+            <span>{i.icon}</span><span>{i.label}</span>
+          </button>
+        ))}
+      </nav>
+      <div className="p-4 border-t border-slate-700 text-xs text-slate-500">ReTool v1.0 — © 2026</div>
+    </aside>
+  );
+}
+
+// ── Dashboard Page ──
+function Dashboard({ nav, addToast }) {
+  const [stats, setStats] = useState(null);
+  const [analyses, setAnalyses] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState('');
+  const [filterStatus, setFilterStatus] = useState('');
+  const [filterType, setFilterType] = useState('');
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [s, a] = await Promise.all([
+        api.get('/api/stats'),
+        api.get(`/api/analyses?status=${filterStatus}&type=${filterType}&search=${search}`)
+      ]);
+      setStats(s);
+      setAnalyses(Array.isArray(a) ? a : (a.analyses || []));
+    } catch(e) { addToast('Lỗi tải dữ liệu', 'error'); }
+    setLoading(false);
+  }, [filterStatus, filterType, search]);
+
+  useEffect(() => { load(); }, [load]);
+
+  if (loading) return <Spinner />;
+
+  const statCards = [
+    { label:'Tổng phân tích', value: stats?.total||0, icon:'📦', color:'bg-indigo-600' },
+    { label:'Hoàn thành', value: stats?.completed||0, icon:'✅', color:'bg-green-600' },
+    { label:'Đang chạy', value: stats?.running||0, icon:'⏳', color:'bg-yellow-600' },
+    { label:'Lỗi', value: stats?.failed||0, icon:'❌', color:'bg-red-600' },
+  ];
+
+  const platforms = stats?.platforms || {};
+  const fileTypes = stats?.file_types || {};
+
+  return (
+    <div className="fade-in space-y-6">
+      <h2 className="text-2xl font-bold text-white">📊 Bảng Điều Khiển</h2>
+      
+      {/* Stat Cards */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        {statCards.map(c => (
+          <div key={c.label} className={`${c.color} rounded-xl p-5 shadow-lg`}>
+            <div className="text-3xl mb-1">{c.icon}</div>
+            <div className="text-2xl font-bold text-white">{c.value}</div>
+            <div className="text-sm text-white/80">{c.label}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Platform & File Type Distribution */}
+      <div className="grid md:grid-cols-2 gap-4">
+        <div className="bg-slate-800 rounded-xl p-5 border border-slate-700">
+          <h3 className="text-lg font-semibold text-white mb-3">🖥️ Phân Bố Nền Tảng</h3>
+          {Object.entries(platforms).length > 0 ? Object.entries(platforms).map(([k,v]) => (
+            <div key={k} className="flex items-center justify-between py-1.5">
+              <span className="text-slate-300">{platformIcon(k)} {k}</span>
+              <div className="flex items-center gap-2">
+                <div className="w-32 bg-slate-700 rounded-full h-2">
+                  <div className="bg-indigo-500 h-2 rounded-full" style={{width:`${Math.min(100, (v/Math.max(1,...Object.values(platforms).reduce((a,b)=>a+b,0)))*100)}%`}}></div>
+                </div>
+                <span className="text-slate-400 text-sm w-8 text-right">{v}</span>
+              </div>
+            </div>
+          )) : <p className="text-slate-500">Chưa có dữ liệu</p>}
+        </div>
+
+        <div className="bg-slate-800 rounded-xl p-5 border border-slate-700">
+          <h3 className="text-lg font-semibold text-white mb-3">📁 Loại File</h3>
+          {Object.entries(fileTypes).length > 0 ? Object.entries(fileTypes).map(([k,v]) => (
+            <div key={k} className="flex items-center justify-between py-1.5">
+              <span>{fileBadge(k)}</span>
+              <div className="flex items-center gap-2">
+                <div className="w-32 bg-slate-700 rounded-full h-2">
+                  <div className="bg-green-500 h-2 rounded-full" style={{width:`${Math.min(100, (v/Math.max(1,...Object.values(fileTypes).reduce((a,b)=>a+b,0)))*100)}%`}}></div>
+                </div>
+                <span className="text-slate-400 text-sm w-8 text-right">{v}</span>
+              </div>
+            </div>
+          )) : <p className="text-slate-500">Chưa có dữ liệu</p>}
+        </div>
+      </div>
+
+      {/* Filters */}
+      <div className="bg-slate-800 rounded-xl p-5 border border-slate-700">
+        <div className="flex flex-wrap gap-3 mb-4">
+          <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="🔍 Tìm kiếm..." className="bg-slate-700 text-white px-4 py-2 rounded-lg border border-slate-600 focus:border-indigo-500 outline-none flex-1 min-w-[200px]" />
+          <select value={filterStatus} onChange={e=>setFilterStatus(e.target.value)} className="bg-slate-700 text-white px-4 py-2 rounded-lg border border-slate-600">
+            <option value="">Tất cả trạng thái</option>
+            <option value="queued">Chờ xử lý</option>
+            <option value="analyzing">Đang phân tích</option>
+            <option value="completed">Hoàn thành</option>
+            <option value="failed">Lỗi</option>
+          </select>
+          <select value={filterType} onChange={e=>setFilterType(e.target.value)} className="bg-slate-700 text-white px-4 py-2 rounded-lg border border-slate-600">
+            <option value="">Tất cả loại</option>
+            <option value="PE">PE</option>
+            <option value="ELF">ELF</option>
+            <option value="APK">APK</option>
+            <option value="DEB">DEB</option>
+          </select>
+        </div>
+
+        <h3 className="text-lg font-semibold text-white mb-3">📋 Phân Tích Gần Đây</h3>
+        <div className="overflow-x-auto">
+          <table className="w-full text-left">
+            <thead>
+              <tr className="border-b border-slate-700 text-slate-400 text-sm">
+                <th className="pb-2 pr-4">Tên file</th>
+                <th className="pb-2 pr-4">Loại</th>
+                <th className="pb-2 pr-4">Nền tảng</th>
+                <th className="pb-2 pr-4">Trạng thái</th>
+                <th className="pb-2 pr-4">Ngày tạo</th>
+              </tr>
+            </thead>
+            <tbody>
+              {analyses.map(a => (
+                <tr key={a.id} onClick={() => nav('analysis', a.id)} className="border-b border-slate-700/50 hover:bg-slate-700/50 cursor-pointer transition-colors">
+                  <td className="py-3 pr-4 text-white font-medium">{a.filename || a.file_name || '—'}</td>
+                  <td className="py-3 pr-4">{fileBadge(a.file_type || a.type)}</td>
+                  <td className="py-3 pr-4">{platformIcon(a.platform)} <span className="text-slate-300">{a.platform||'—'}</span></td>
+                  <td className="py-3 pr-4">{statusBadge(a.status)}</td>
+                  <td className="py-3 pr-4 text-slate-400 text-sm">{a.created_at ? new Date(a.created_at).toLocaleString('vi-VN') : '—'}</td>
+                </tr>
+              ))}
+              {analyses.length===0 && <tr><td colSpan={5} className="py-8 text-center text-slate-500">Chưa có phân tích nào</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Upload Page ──
+function UploadPage({ nav, addToast }) {
+  const [file, setFile] = useState(null);
+  const [profile, setProfile] = useState('quick');
+  const [dragOver, setDragOver] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const inputRef = useRef();
+
+  const profiles = [
+    { id:'quick', label:'⚡ Quét nhanh', desc:'Phân tích cơ bản, nhanh' },
+    { id:'deep', label:'🔬 Phân tích sâu', desc:'Kiểm tra chi tiết' },
+    { id:'runtime', label:'▶️ Runtime', desc:'Giám sát thời gian chạy' },
+    { id:'full', label:'📊 Full Report', desc:'Báo cáo đầy đủ' },
+  ];
+
+  const handleDrop = (e) => {
+    e.preventDefault(); setDragOver(false);
+    const f = e.dataTransfer.files[0];
+    if (f) setFile(f);
+  };
+
+  const handleUpload = async () => {
+    if (!file) { addToast('Vui lòng chọn file', 'error'); return; }
+    setUploading(true);
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('profile', profile);
+    try {
+      const res = await api.post('/api/upload', fd);
+      if (res.id || res.analysis_id) {
+        addToast('Tải lên thành công! Đang bắt đầu phân tích...', 'success');
+        setFile(null);
+        nav('analysis', res.id || res.analysis_id);
+      } else {
+        addToast(res.error || 'Tải lên thất bại', 'error');
+      }
+    } catch(e) { addToast('Lỗi kết nối', 'error'); }
+    setUploading(false);
+  };
+
+  return (
+    <div className="fade-in max-w-2xl mx-auto space-y-6">
+      <h2 className="text-2xl font-bold text-white">📤 Phân Tích Mới</h2>
+
+      {/* Drop Zone */}
+      <div
+        className={`border-2 border-dashed rounded-2xl p-12 text-center transition-colors cursor-pointer ${dragOver ? 'drop-zone-active' : 'border-slate-600 hover:border-slate-500'}`}
+        onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={handleDrop}
+        onClick={() => inputRef.current?.click()}
+      >
+        <input ref={inputRef} type="file" className="hidden" onChange={e => { if(e.target.files[0]) setFile(e.target.files[0]); }} />
+        {file ? (
+          <div>
+            <div className="text-4xl mb-3">📄</div>
+            <p className="text-white font-semibold text-lg">{file.name}</p>
+            <p className="text-slate-400">{(file.size/1024/1024).toFixed(2)} MB</p>
+          </div>
+        ) : (
+          <div>
+            <div className="text-5xl mb-3">📁</div>
+            <p className="text-white font-semibold text-lg">Kéo thả file vào đây</p>
+            <p className="text-slate-400 mt-1">hoặc click để chọn file</p>
+            <p className="text-slate-500 text-sm mt-2">Hỗ trợ: EXE, DLL, APK, DEB, ELF, DMG, IPA...</p>
+          </div>
+        )}
+      </div>
+
+      {/* Profile Selector */}
+      <div className="bg-slate-800 rounded-xl p-5 border border-slate-700">
+        <h3 className="text-lg font-semibold text-white mb-3">⚙️ Chế độ phân tích</h3>
+        <div className="grid grid-cols-2 gap-3">
+          {profiles.map(p => (
+            <button key={p.id} onClick={() => setProfile(p.id)} className={`p-4 rounded-xl border-2 text-left transition-all ${profile===p.id ? 'border-indigo-500 bg-indigo-500/10' : 'border-slate-700 hover:border-slate-600'}`}>
+              <div className="font-semibold text-white">{p.label}</div>
+              <div className="text-sm text-slate-400 mt-1">{p.desc}</div>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Start Button */}
+      <button onClick={handleUpload} disabled={uploading || !file} className={`w-full py-4 rounded-xl font-bold text-lg transition-all ${uploading || !file ? 'bg-slate-700 text-slate-500 cursor-not-allowed' : 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg'}`}>
+        {uploading ? '⏳ Đang tải lên...' : '🚀 Bắt đầu phân tích'}
+      </button>
+    </div>
+  );
+}
+
+// ── Analysis Detail ──
+function AnalysisDetail({ id, nav, addToast }) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [tab, setTab] = useState('overview');
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const d = await api.get(`/api/analyses/${id}`);
+      setData(d);
+    } catch(e) { addToast('Lỗi tải phân tích', 'error'); }
+    setLoading(false);
+  };
+
+  useEffect(() => { load(); }, [id]);
+
+  const handleDelete = async () => {
+    if (!confirm('Bạn có chắc muốn xóa?')) return;
+    try {
+      await api.delete(`/api/analyses/${id}`);
+      addToast('Đã xóa phân tích', 'success');
+      nav('dashboard');
+    } catch(e) { addToast('Lỗi xóa', 'error'); }
+  };
+
+  const handleReanalyze = async () => {
+    try {
+      await api.post(`/api/analyses/${id}/reanalyze`);
+      addToast('Đang phân tích lại...', 'success');
+      load();
+    } catch(e) { addToast('Lỗi', 'error'); }
+  };
+
+  const downloadReport = (fmt) => {
+    const content = fmt === 'json' ? JSON.stringify(data, null, 2) : (data.report || JSON.stringify(data, null, 2));
+    const blob = new Blob([content], { type: fmt==='json' ? 'application/json' : 'text/markdown' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `retool-report-${id}.${fmt==='json'?'json':'md'}`;
+    a.click();
+  };
+
+  if (loading) return <Spinner />;
+  if (!data) return <div className="text-red-400 text-center py-12">Không tìm thấy phân tích</div>;
+
+  const result = data.result || data;
+  const techStack = result.tech_stack || result.techStack || [];
+  const features = result.features || [];
+  const dependencies = result.dependencies || [];
+  const designPatterns = result.design_patterns || result.designPatterns || [];
+  const componentDiagram = result.component_diagram || result.componentDiagram || '';
+  const apis = result.apis || result.endpoints || [];
+  const decompiled = result.decompiled_code || result.decompiledCode || result.source_code || '';
+  const keyFunctions = result.key_functions || result.keyFunctions || [];
+  const networkActivity = result.network_activity || result.networkActivity || [];
+  const dataModels = result.data_models || result.dataModels || [];
+  const configValues = result.config_values || result.configValues || {};
+  const hardcodedSettings = result.hardcoded_settings || result.hardcodedSettings || {};
+  const report = result.report || data.report || '';
+  const threatScore = result.threat_score || result.threatScore || 0;
+
+  const tabs = [
+    { id:'overview', label:'📋 Tổng Quan' },
+    { id:'architecture', label:'🏗️ Kiến Trúc' },
+    { id:'apis', label:'🔌 APIs' },
+    { id:'source', label:'💻 Mã Nguồn' },
+    { id:'network', label:'🌐 Network' },
+    { id:'data', label:'🗄️ Cấu Trúc Dữ Liệu' },
+    { id:'report', label:'📝 Báo Cáo' },
+  ];
+
+  return (
+    <div className="fade-in space-y-6">
+      {/* Header */}
+      <div className="flex items-center justify-between flex-wrap gap-3">
+        <div>
+          <button onClick={() => nav('dashboard')} className="text-indigo-400 hover:text-indigo-300 text-sm mb-2">← Quay lại</button>
+          <h2 className="text-2xl font-bold text-white flex items-center gap-2">
+            {fileBadge(data.file_type || result.file_type)} {data.filename || result.filename || 'Phân tích'}
+          </h2>
+          <div className="flex items-center gap-3 mt-1">
+            {statusBadge(data.status)}
+            <span className="text-slate-400 text-sm">{platformIcon(data.platform || result.platform)} {data.platform || result.platform || '—'}</span>
+          </div>
+        </div>
+        <div className="flex gap-2">
+          <button onClick={handleReanalyze} className="px-4 py-2 bg-yellow-600 hover:bg-yellow-500 text-white rounded-lg text-sm">🔄 Phân tích lại</button>
+          <button onClick={handleDelete} className="px-4 py-2 bg-red-600 hover:bg-red-500 text-white rounded-lg text-sm">🗑️ Xóa</button>
+        </div>
+      </div>
+
+      {/* Tabs */}
+      <div className="flex gap-1 overflow-x-auto border-b border-slate-700 pb-0">
+        {tabs.map(t => (
+          <button key={t.id} onClick={() => setTab(t.id)} className={`px-4 py-2.5 text-sm font-medium whitespace-nowrap rounded-t-lg transition-colors ${tab===t.id ? 'bg-slate-800 text-indigo-400 border-b-2 border-indigo-500' : 'text-slate-400 hover:text-slate-200'}`}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {/* Tab Content */}
+      <div className="bg-slate-800 rounded-xl p-6 border border-slate-700 min-h-[400px]">
+        {/* Overview */}
+        {tab === 'overview' && (
+          <div className="space-y-6">
+            {/* File Info */}
+            <div className="grid md:grid-cols-2 gap-4">
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-2">📄 Thông tin file</h3>
+                <div className="space-y-1 text-sm">
+                  <p className="text-slate-300"><span className="text-slate-500">Tên:</span> {data.filename || result.filename}</p>
+                  <p className="text-slate-300"><span className="text-slate-500">Loại:</span> {data.file_type || result.file_type}</p>
+                  <p className="text-slate-300"><span className="text-slate-500">Kích thước:</span> {data.file_size || result.file_size ? `${((data.file_size||result.file_size)/1024/1024).toFixed(2)} MB` : '—'}</p>
+                  <p className="text-slate-300"><span className="text-slate-500">Nền tảng:</span> {platformIcon(data.platform||result.platform)} {data.platform || result.platform}</p>
+                  <p className="text-slate-300"><span className="text-slate-500">Kiến trúc:</span> {result.architecture || '—'}</p>
+                </div>
+              </div>
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-2">🎯 Mức đe dọa</h3>
+                <div className="flex items-center gap-4">
+                  <div className={`text-5xl font-bold ${threatScore > 7 ? 'text-red-500' : threatScore > 4 ? 'text-yellow-500' : 'text-green-500'}`}>
+                    {threatScore}/10
+                  </div>
+                  <div className="flex-1">
+                    <div className="w-full bg-slate-700 rounded-full h-4">
+                      <div className={`h-4 rounded-full ${threatScore > 7 ? 'bg-red-500' : threatScore > 4 ? 'bg-yellow-500' : 'bg-green-500'}`} style={{width:`${threatScore*10}%`}}></div>
+                    </div>
+                    <p className="text-slate-400 text-sm mt-1">{threatScore > 7 ? '⚠️ Nguy hiểm' : threatScore > 4 ? '⚡ Trung bình' : '✅ An toàn'}</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Tech Stack */}
+            {techStack.length > 0 && (
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-2">🛠️ Tech Stack</h3>
+                <div className="flex flex-wrap gap-2">
+                  {techStack.map((t,i) => <span key={i} className="px-3 py-1 bg-indigo-600/30 text-indigo-300 rounded-full text-sm border border-indigo-500/30">{typeof t==='string'?t:t.name||t}</span>)}
+                </div>
+              </div>
+            )}
+
+            {/* Architecture Summary */}
+            {result.architecture_summary && (
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-2">📐 Tóm tắt kiến trúc</h3>
+                <p className="text-slate-300">{result.architecture_summary}</p>
+              </div>
+            )}
+
+            {/* Features */}
+            {features.length > 0 && (
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-2">✨ Tính năng phát hiện</h3>
+                <div className="grid md:grid-cols-2 gap-2">
+                  {features.map((f,i) => (
+                    <div key={i} className="flex items-start gap-2 text-slate-300 text-sm">
+                      <span className="text-green-400 mt-0.5">✓</span>
+                      {typeof f==='string'?f:f.name||JSON.stringify(f)}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Architecture */}
+        {tab === 'architecture' && (
+          <div className="space-y-6">
+            {dependencies.length > 0 && (
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-3">📦 Dependencies</h3>
+                <div className="bg-slate-900 rounded-lg p-4 font-mono text-sm max-h-80 overflow-y-auto">
+                  {dependencies.map((d,i) => (
+                    <div key={i} className="text-slate-300 py-1">
+                      <span className="text-indigo-400">├──</span> {typeof d==='string'?d:d.name||JSON.stringify(d)}
+                      {typeof d==='object'&&d.version && <span className="text-slate-500 ml-2">@{d.version}</span>}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {designPatterns.length > 0 && (
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-3">🎯 Design Patterns</h3>
+                <div className="flex flex-wrap gap-2">
+                  {designPatterns.map((p,i) => <span key={i} className="px-3 py-1.5 bg-purple-600/20 text-purple-300 rounded-lg text-sm border border-purple-500/30">{typeof p==='string'?p:p.name||JSON.stringify(p)}</span>)}
+                </div>
+              </div>
+            )}
+            {componentDiagram && (
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-3">🗺️ Sơ đồ thành phần</h3>
+                <pre className="bg-slate-900 rounded-lg p-4 text-sm text-slate-300 overflow-x-auto font-mono whitespace-pre-wrap">{componentDiagram}</pre>
+              </div>
+            )}
+            {dependencies.length===0 && !componentDiagram && designPatterns.length===0 && <p className="text-slate-500">Không có dữ liệu kiến trúc</p>}
+          </div>
+        )}
+
+        {/* APIs */}
+        {tab === 'apis' && (
+          <div>
+            <h3 className="text-lg font-semibold text-white mb-3">🔌 API Endpoints</h3>
+            {apis.length > 0 ? (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left">
+                  <thead>
+                    <tr className="border-b border-slate-700 text-slate-400 text-sm">
+                      <th className="pb-2 pr-4">Method</th>
+                      <th className="pb-2 pr-4">URL</th>
+                      <th className="pb-2 pr-4">Loại</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {apis.map((a,i) => (
+                      <tr key={i} className="border-b border-slate-700/50">
+                        <td className="py-2 pr-4">
+                          <span className={`px-2 py-0.5 rounded text-xs font-bold text-white ${
+                            (a.method||'GET')==='GET'?'bg-green-600':(a.method||'')==='POST'?'bg-blue-600':(a.method||'')==='PUT'?'bg-yellow-600':(a.method||'')==='DELETE'?'bg-red-600':'bg-slate-600'
+                          }`}>{a.method||'GET'}</span>
+                        </td>
+                        <td className="py-2 pr-4 text-slate-300 font-mono text-sm">{a.url||a.endpoint||a.path||'—'}</td>
+                        <td className="py-2 pr-4 text-slate-400 text-sm">{a.type||a.category||'—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : <p className="text-slate-500">Không phát hiện API</p>}
+          </div>
+        )}
+
+        {/* Source Code */}
+        {tab === 'source' && (
+          <div className="space-y-6">
+            {keyFunctions.length > 0 && (
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-3">⚡ Hàm chính</h3>
+                <div className="grid md:grid-cols-2 gap-2">
+                  {keyFunctions.map((f,i) => (
+                    <div key={i} className="bg-slate-900 rounded-lg px-4 py-2 text-sm">
+                      <span className="text-indigo-400 font-mono">{typeof f==='string'?f:f.name||JSON.stringify(f)}</span>
+                      {typeof f==='object'&&f.address && <span className="text-slate-500 ml-2">@{f.address}</span>}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            <div>
+              <h3 className="text-lg font-semibold text-white mb-3">💻 Mã nguồn (Decompiled)</h3>
+              {decompiled ? (
+                <pre className="bg-slate-900 rounded-lg p-4 text-sm text-slate-300 overflow-auto max-h-[500px] font-mono whitespace-pre-wrap leading-relaxed">
+                  {decompiled.split('\n').map((line, i) => (
+                    <div key={i} className="flex"><span className="text-slate-600 w-10 text-right pr-3 select-none flex-shrink-0">{i+1}</span><span className="flex-1">{line}</span></div>
+                  ))}
+                </pre>
+              ) : <p className="text-slate-500">Không có mã nguồn</p>}
+            </div>
+          </div>
+        )}
+
+        {/* Network */}
+        {tab === 'network' && (
+          <div>
+            <h3 className="text-lg font-semibold text-white mb-3">🌐 Hoạt động mạng</h3>
+            {networkActivity.length > 0 ? (
+              <div className="space-y-2">
+                {networkActivity.map((n,i) => (
+                  <div key={i} className="bg-slate-900 rounded-lg p-3 flex items-center justify-between">
+                    <div>
+                      <span className="text-indigo-400 font-mono text-sm">{n.host || n.url || n.domain || '—'}</span>
+                      {n.port && <span className="text-slate-500 ml-2">:{n.port}</span>}
+                    </div>
+                    <span className="text-slate-400 text-sm">{n.type || n.protocol || '—'}</span>
+                  </div>
+                ))}
+              </div>
+            ) : <p className="text-slate-500">Không phát hiện hoạt động mạng</p>}
+          </div>
+        )}
+
+        {/* Data Structures */}
+        {tab === 'data' && (
+          <div className="space-y-6">
+            {dataModels.length > 0 && (
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-3">📊 Models dữ liệu</h3>
+                <div className="space-y-2">
+                  {dataModels.map((m,i) => (
+                    <div key={i} className="bg-slate-900 rounded-lg p-3">
+                      <span className="text-green-400 font-mono text-sm font-bold">{typeof m==='string'?m:m.name||JSON.stringify(m)}</span>
+                      {typeof m==='object'&&m.fields && <div className="mt-1 text-slate-400 text-xs">{Array.isArray(m.fields)?m.fields.join(', '):JSON.stringify(m.fields)}</div>}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {Object.keys(configValues).length > 0 && (
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-3">⚙️ Cấu hình</h3>
+                <div className="bg-slate-900 rounded-lg p-4 font-mono text-sm">
+                  {Object.entries(configValues).map(([k,v]) => (
+                    <div key={k} className="py-1"><span className="text-yellow-400">{k}</span><span className="text-slate-500"> = </span><span className="text-green-400">{typeof v==='object'?JSON.stringify(v):String(v)}</span></div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {Object.keys(hardcodedSettings).length > 0 && (
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-3">🔒 Hardcoded Settings</h3>
+                <div className="bg-slate-900 rounded-lg p-4 font-mono text-sm">
+                  {Object.entries(hardcodedSettings).map(([k,v]) => (
+                    <div key={k} className="py-1"><span className="text-red-400">{k}</span><span className="text-slate-500"> = </span><span className="text-orange-400">{typeof v==='object'?JSON.stringify(v):String(v)}</span></div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {dataModels.length===0 && Object.keys(configValues).length===0 && Object.keys(hardcodedSettings).length===0 && <p className="text-slate-500">Không có dữ liệu cấu trúc</p>}
+          </div>
+        )}
+
+        {/* Report */}
+        {tab === 'report' && (
+          <div className="space-y-4">
+            <div className="flex gap-2">
+              <button onClick={() => downloadReport('json')} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-sm">📥 Export JSON</button>
+              <button onClick={() => downloadReport('md')} className="px-4 py-2 bg-green-600 hover:bg-green-500 text-white rounded-lg text-sm">📥 Export Markdown</button>
+            </div>
+            {report ? (
+              <div className="prose prose-invert max-w-none bg-slate-900 rounded-lg p-6 text-slate-300 leading-relaxed" dangerouslySetInnerHTML={{__html: renderMarkdown(report)}} />
+            ) : <p className="text-slate-500">Chưa có báo cáo</p>}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Main App ──
+function App() {
+  const [page, setPage] = useState('dashboard');
+  const [analysisId, setAnalysisId] = useState(null);
+  const [toasts, setToasts] = useState([]);
+
+  const addToast = (msg, type='info') => {
+    const id = ++toastId;
+    setToasts(t => [...t, { id, msg, type }]);
+    setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), 4000);
+  };
+  const removeToast = (id) => setToasts(t => t.filter(x => x.id !== id));
+
+  const nav = (p, aid) => {
+    setPage(p);
+    setAnalysisId(aid || null);
+    window.location.hash = p === 'analysis' ? `analysis/${aid}` : p;
+  };
+
+  // Hash routing
+  useEffect(() => {
+    const handleHash = () => {
+      const hash = window.location.hash.slice(1) || 'dashboard';
+      if (hash.startsWith('analysis/')) {
+        setPage('analysis');
+        setAnalysisId(hash.split('/')[1]);
+      } else {
+        setPage(hash);
+        setAnalysisId(null);
+      }
+    };
+    handleHash();
+    window.addEventListener('hashchange', handleHash);
+    return () => window.removeEventListener('hashchange', handleHash);
+  }, []);
+
+  return (
+    <div className="flex min-h-screen bg-slate-900 text-slate-100">
+      <Sidebar page={page} nav={nav} />
+      <main className="flex-1 p-6 overflow-y-auto">
+        {page === 'dashboard' && <Dashboard nav={nav} addToast={addToast} />}
+        {page === 'upload' && <UploadPage nav={nav} addToast={addToast} />}
+        {page === 'analysis' && analysisId && <AnalysisDetail id={analysisId} nav={nav} addToast={addToast} />}
+      </main>
+      <ToastContainer toasts={toasts} remove={removeToast} />
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

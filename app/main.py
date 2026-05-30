@@ -11,11 +11,11 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.config import settings
-from app.database import init_db
-from app.api.upload import router as upload_router
-from app.api.analysis import router as analysis_router
-from app.api.stats import router as stats_router
+from .config import settings
+from .database import init_db
+from .api.upload import router as upload_router
+from .api.analysis import router as analysis_router
+from .api.stats import router as stats_router
 
 
 @asynccontextmanager
@@ -68,7 +68,7 @@ app.include_router(analysis_router)
 app.include_router(stats_router)
 
 # Serve frontend if templates exist
-templates_dir = os.path.join(os.path.dirname(__file__), "..", "templates")
+templates_dir = os.path.join(os.path.dirname(__file__), "templates")
 static_dir = os.path.join(os.path.dirname(__file__), "..", "static")
 
 # Mount static files if directory exists

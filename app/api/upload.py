@@ -14,10 +14,10 @@ from datetime import datetime
 from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from app.config import settings
-from app.database import get_db
-from app.models import Analysis
-from app.engines.static_engine import run_local_analysis, merge_worker_results, mark_completed
+from ..config import settings
+from ..database import get_db
+from ..models import Analysis
+from ..engines.static_engine import run_local_analysis, merge_worker_results, mark_completed
 
 router = APIRouter(prefix="/api", tags=["upload"])
 

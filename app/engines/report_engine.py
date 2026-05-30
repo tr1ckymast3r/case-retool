@@ -7,8 +7,8 @@ import json
 import os
 from datetime import datetime
 
-from app.config import settings
-from app.models import Analysis
+from ..config import settings
+from ..models import Analysis
 
 
 def _safe_json(text: str) -> dict:

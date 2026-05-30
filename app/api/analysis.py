@@ -12,10 +12,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 
-from app.database import get_db
-from app.models import Analysis
-from app.engines.static_engine import run_local_analysis
-from app.engines.report_engine import generate_report
+from ..database import get_db
+from ..models import Analysis
+from ..engines.static_engine import run_local_analysis
+from ..engines.report_engine import generate_report
 
 router = APIRouter(prefix="/api", tags=["analyses"])
 
@@ -129,7 +129,7 @@ def delete_analysis(analysis_id: str, db: Session = Depends(get_db)):
             pass
 
     # Remove report directory
-    from app.config import settings
+    from ..config import settings
     report_dir = os.path.join(settings.REPORTS_DIR, analysis_id)
     if os.path.exists(report_dir):
         try:
@@ -171,7 +171,7 @@ def reanalyze(analysis_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(e))
 
     # Re-send to worker
-    from app.api.upload import _start_worker_poll
+    from .upload import _start_worker_poll
     _start_worker_poll(
         analysis_id=analysis_id,
         filepath=analysis.filepath,

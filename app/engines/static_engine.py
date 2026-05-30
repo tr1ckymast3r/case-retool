@@ -13,7 +13,7 @@ import json
 import magic  # python-magic
 from datetime import datetime
 
-from app.models import Analysis
+from ..models import Analysis
 
 
 def detect_file_type(filepath: str) -> dict:
@@ -507,7 +507,7 @@ def run_local_analysis(analysis: Analysis, db) -> None:
 
 def merge_worker_results(analysis_id: str, worker_result: dict, db) -> None:
     """Merge worker deep analysis results into the analysis record."""
-    from app.database import SessionLocal
+    from ..database import SessionLocal
 
     # Open a new session since we're in a background thread
     session = SessionLocal()
@@ -566,7 +566,7 @@ def merge_worker_results(analysis_id: str, worker_result: dict, db) -> None:
 
         # Generate report
         try:
-            from app.engines.report_engine import generate_report
+            from .report_engine import generate_report
             generate_report(analysis, session)
         except Exception as e:
             analysis.error_message = f"Report generation warning: {str(e)}"
@@ -585,7 +585,7 @@ def merge_worker_results(analysis_id: str, worker_result: dict, db) -> None:
 
 def mark_completed(analysis_id: str, db) -> None:
     """Mark analysis as completed with local results only (worker timeout)."""
-    from app.database import SessionLocal
+    from ..database import SessionLocal
 
     session = SessionLocal()
     try:
@@ -598,7 +598,7 @@ def mark_completed(analysis_id: str, db) -> None:
 
         # Generate report from local results
         try:
-            from app.engines.report_engine import generate_report
+            from .report_engine import generate_report
             generate_report(analysis, session)
         except Exception:
             pass
