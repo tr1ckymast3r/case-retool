@@ -826,30 +826,121 @@ function AnalysisDetail({ id, nav, addToast }) {
               </div>
             ) : (
               <>
-                {/* Fallback: generic decompiled view */}
-                {keyFunctions.length > 0 && (
-                  <div>
-                    <h3 className="text-lg font-semibold text-white mb-3">⚡ Hàm chính</h3>
-                    <div className="grid md:grid-cols-2 gap-2">
-                      {keyFunctions.map((f,i) => (
-                        <div key={i} className="bg-slate-900 rounded-lg px-4 py-2 text-sm">
-                          <span className="text-indigo-400 font-mono">{typeof f==='string'?f:f.name||JSON.stringify(f)}</span>
-                          {typeof f==='object'&&f.address && <span className="text-slate-500 ml-2">@{f.address}</span>}
+                {/* Ghidra Results — Native Binary */}
+                {(() => {
+                  const _ghidra = _results.ghidra || {};
+                  const ghidraDecompiled = Array.isArray(_ghidra.decompiled) ? _ghidra.decompiled : [];
+                  const interesting = _ghidra.interesting_functions || {};
+                  const ghidraFunctions = Array.isArray(_ghidra.functions) ? _ghidra.functions : [];
+                  const totalFuncs = _ghidra.total_functions || ghidraFunctions.length;
+
+                  if (ghidraDecompiled.length > 0 || ghidraFunctions.length > 0) {
+                    return (
+                      <div className="space-y-6">
+                        {/* Stats */}
+                        <div className="flex flex-wrap gap-3">
+                          <span className="px-3 py-1 bg-indigo-600/20 text-indigo-300 rounded-full text-sm">
+                            🔧 {totalFuncs} functions total
+                          </span>
+                          <span className="px-3 py-1 bg-green-600/20 text-green-300 rounded-full text-sm">
+                            💻 {ghidraDecompiled.length} decompiled
+                          </span>
+                          {_ghidra.entry_point && (
+                            <span className="px-3 py-1 bg-yellow-600/20 text-yellow-300 rounded-full text-sm">
+                              📍 Entry: {_ghidra.entry_point}
+                            </span>
+                          )}
                         </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-                <div>
-                  <h3 className="text-lg font-semibold text-white mb-3">💻 Mã nguồn (Decompiled)</h3>
-                  {decompiled ? (
-                    <pre className="bg-slate-900 rounded-lg p-4 text-sm text-slate-300 overflow-auto max-h-[500px] font-mono whitespace-pre-wrap leading-relaxed">
-                      {decompiled.split('\n').map((line, i) => (
-                        <div key={i} className="flex"><span className="text-slate-600 w-10 text-right pr-3 select-none flex-shrink-0">{i+1}</span><span className="flex-1">{line}</span></div>
-                      ))}
-                    </pre>
-                  ) : <p className="text-slate-500">Không có mã nguồn. Thử profile "deep_static" hoặc "full" cho native binaries.</p>}
-                </div>
+
+                        {/* Interesting Functions */}
+                        {Object.keys(interesting).length > 0 && (
+                          <div>
+                            <h3 className="text-lg font-semibold text-white mb-3">🎯 Interesting Functions</h3>
+                            <div className="space-y-3">
+                              {Object.entries(interesting).map(([cat, funcs]) => (
+                                <div key={cat} className="bg-slate-900 rounded-lg p-4">
+                                  <p className="text-sm font-semibold text-indigo-400 mb-2">
+                                    {cat === 'crypto' && '🔐'} {cat === 'network' && '🌐'} {cat === 'file_io' && '📁'}
+                                    {cat === 'registry' && '📋'} {cat === 'process_injection' && '💉'} {cat === 'anti_debug' && '🛡️'}
+                                    {' '}{cat.replace('_', ' ')} ({funcs.length})
+                                  </p>
+                                  <div className="grid md:grid-cols-2 gap-1">
+                                    {funcs.slice(0, 10).map((f, fi) => (
+                                      <div key={fi} className="text-xs font-mono text-slate-300 bg-slate-800 rounded px-2 py-1">
+                                        {f.name} <span className="text-slate-500">@ {f.address}</span>
+                                        {f.callees && f.callees.length > 0 && (
+                                          <span className="text-slate-600"> → {f.callees.slice(0, 3).join(', ')}</span>
+                                        )}
+                                      </div>
+                                    ))}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Decompiled Functions */}
+                        {ghidraDecompiled.length > 0 && (
+                          <div>
+                            <h3 className="text-lg font-semibold text-white mb-3">💻 Decompiled Code ({ghidraDecompiled.length} functions)</h3>
+                            <div className="space-y-3">
+                              {ghidraDecompiled.slice(0, 50).map((f, fi) => (
+                                <details key={fi} className="bg-slate-900 rounded-lg border border-slate-700">
+                                  <summary className="px-4 py-2 cursor-pointer hover:bg-slate-800 rounded-lg flex items-center justify-between">
+                                    <span className="text-indigo-400 font-mono text-sm">{f.name}</span>
+                                    <div className="flex items-center gap-2">
+                                      <span className="text-slate-500 text-xs">{f.size} bytes</span>
+                                      <span className="text-slate-600 text-xs">@ {f.address}</span>
+                                    </div>
+                                  </summary>
+                                  {f.code && (
+                                    <pre className="px-4 pb-3 text-sm text-slate-300 overflow-auto max-h-[400px] font-mono whitespace-pre leading-relaxed border-t border-slate-700 pt-2">
+                                      {f.code.split('\n').map((line, li) => (
+                                        <div key={li} className="flex hover:bg-slate-800/50">
+                                          <span className="text-slate-600 w-10 text-right pr-3 select-none flex-shrink-0">{li+1}</span>
+                                          <span className="flex-1">{line}</span>
+                                        </div>
+                                      ))}
+                                    </pre>
+                                  )}
+                                </details>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  }
+
+                  // Fallback: legacy decompiled view
+                  return (
+                    <>
+                      {keyFunctions.length > 0 && (
+                        <div>
+                          <h3 className="text-lg font-semibold text-white mb-3">⚡ Hàm chính</h3>
+                          <div className="grid md:grid-cols-2 gap-2">
+                            {keyFunctions.map((f,i) => (
+                              <div key={i} className="bg-slate-900 rounded-lg px-4 py-2 text-sm">
+                                <span className="text-indigo-400 font-mono">{typeof f==='string'?f:f.name||JSON.stringify(f)}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      <div>
+                        <h3 className="text-lg font-semibold text-white mb-3">💻 Mã nguồn (Decompiled)</h3>
+                        {decompiled ? (
+                          <pre className="bg-slate-900 rounded-lg p-4 text-sm text-slate-300 overflow-auto max-h-[500px] font-mono whitespace-pre-wrap leading-relaxed">
+                            {decompiled.split('\n').map((line, i) => (
+                              <div key={i} className="flex"><span className="text-slate-600 w-10 text-right pr-3 select-none flex-shrink-0">{i+1}</span><span className="flex-1">{line}</span></div>
+                            ))}
+                          </pre>
+                        ) : <p className="text-slate-500">Không có mã nguồn</p>}
+                      </div>
+                    </>
+                  );
+                })()}
               </>
             )}
           </div>

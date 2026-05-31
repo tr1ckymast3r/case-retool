@@ -509,8 +509,10 @@ def analyze_dotnet_deep(filepath, output):
 
 
 def run_ghidra_decompile(filepath, output):
-    """Run Ghidra headless analysis."""
-    result = {"functions": [], "decompiled": {}, "call_graph": {}, "error": None}
+    """Run Ghidra headless analysis — function tracing, call graph, decompilation."""
+    result = {"functions": [], "decompiled": [], "call_graph": {},
+              "interesting_functions": {}, "entry_point": None, "total_functions": 0,
+              "import_table": [], "export_table": [], "error": None}
 
     with tempfile.TemporaryDirectory(prefix="retool_ghidra_") as tmpdir:
         project_dir = os.path.join(tmpdir, "project")
@@ -518,47 +520,189 @@ def run_ghidra_decompile(filepath, output):
         os.makedirs(project_dir, exist_ok=True)
         os.makedirs(output_dir, exist_ok=True)
 
-        # Copy file
         fname = os.path.basename(filepath)
         shutil.copy2(filepath, os.path.join(tmpdir, fname))
 
-        # Run Ghidra headless
-        ghidra_script = """
+        # Enhanced Ghidra script — traces calls, identifies interesting funcs
+        ghidra_script = r"""
 import ghidra.app.decompiler as Decomp
 from ghidra.program.model.listing import Function
-from ghidra.program.model.symbol import SymbolType
+from ghidra.program.model.symbol import SymbolType, SourceType
+from ghidra.program.model.address import AddressSet
+import json
 
 program = getCurrentProgram()
 decomp = Decomp.DecompInterface()
 decomp.openProgram(program)
-
 fm = program.getFunctionManager()
-results = []
+listing = program.getListing()
+memory = program.getMemory()
 
+# === Entry point ===
+entry = program.getSymbolTable().getExternalEntryPoint()
+entry_addr = str(program.getEntryPoint()) if program.getEntryPoint() else None
+
+# === Interesting function keywords ===
+CRYPTO_KEYWORDS = ["aes", "des", "rsa", "sha", "md5", "encrypt", "decrypt", "cipher",
+                   "hash", "hmac", "crypto", "rc4", "blowfish", "chacha", "xor"]
+NETWORK_KEYWORDS = ["socket", "connect", "send", "recv", "http", "url", "dns",
+                    "curl", "wget", "wininet", "winhttp", "inet", "ftp", "smtp",
+                    "urlopen", "requests", "bind", "listen", "accept"]
+FILE_KEYWORDS = ["createfile", "writefile", "readfile", "deletefile", "movefile",
+                 "copyfile", "openfile", "findfirst", "findnext", "fopen", "fwrite",
+                 "fread", "mkdir", "rmdir", "unlink", "rename"]
+REGISTRY_KEYWORDS = ["regopen", "regset", "regquery", "regcreate", "regdelete",
+                     "regclose"]
+PROCESS_KEYWORDS = ["createprocess", "shellexecute", "virtualalloc", "virtualprotect",
+                    "loadlibrary", "getprocaddress", "writeprocessmemory",
+                    "createremotethread", "ntwritevirtualmemory", "mmap", "mprotect",
+                    "dlopen", "dlsym"]
+ANTI_DEBUG_KEYWORDS = ["isdebuggerpresent", "checkremotedebuggerpresent",
+                       "ntqueryinformationprocess", "ptrace", "debugbreak",
+                       "outputdebugstring"]
+
+all_funcs = []
+interesting = {"crypto": [], "network": [], "file_io": [], "registry": [],
+               "process_injection": [], "anti_debug": [], "entry_functions": []}
+call_graph = {}
+
+# === Iterate all functions ===
 for func in fm.getFunctions(True):
     if func.isThunk():
         continue
     name = func.getName()
+    name_lower = name.lower()
     addr = str(func.getEntryPoint())
     size = func.getBody().getNumAddresses()
+    is_external = func.isExternal()
+    calling_conv = str(func.getCallingConventionName()) if func.getCallingConventionName() else "unknown"
 
-    # Decompile
+    # Get called functions (callees)
+    callees = []
+    ref_mgr = program.getReferenceManager()
+    body = func.getBody()
+    for ref_addr in body:
+        refs = ref_mgr.getReferencesFrom(ref_addr)
+        for ref in refs:
+            if ref.getReferenceType().isCall():
+                callee_addr = ref.getToAddress()
+                callee_sym = program.getSymbolTable().getPrimarySymbol(callee_addr)
+                if callee_sym:
+                    callees.append(str(callee_sym))
+
+    func_info = {
+        "name": name,
+        "address": addr,
+        "size": size,
+        "external": is_external,
+        "calling_conv": calling_conv,
+        "callees": list(set(callees))[:20]
+    }
+
+    all_funcs.append(func_info)
+    call_graph[name] = list(set(callees))[:20]
+
+    # Categorize interesting functions
+    for kw in CRYPTO_KEYWORDS:
+        if kw in name_lower:
+            interesting["crypto"].append(func_info)
+            break
+    for kw in NETWORK_KEYWORDS:
+        if kw in name_lower:
+            interesting["network"].append(func_info)
+            break
+    for kw in FILE_KEYWORDS:
+        if kw in name_lower:
+            interesting["file_io"].append(func_info)
+            break
+    for kw in REGISTRY_KEYWORDS:
+        if kw in name_lower:
+            interesting["registry"].append(func_info)
+            break
+    for kw in PROCESS_KEYWORDS:
+        if kw in name_lower:
+            interesting["process_injection"].append(func_info)
+            break
+    for kw in ANTI_DEBUG_KEYWORDS:
+        if kw in name_lower:
+            interesting["anti_debug"].append(func_info)
+            break
+
+# === Decompile TOP functions (biggest + entry + interesting) ===
+decompile_targets = set()
+
+# Entry point function
+entry_func = fm.getFunctionAt(program.getEntryPoint())
+if entry_func:
+    decompile_targets.add(entry_func.getEntryPoint())
+
+# Top 30 biggest functions
+sorted_by_size = sorted(all_funcs, key=lambda x: x["size"], reverse=True)
+for f in sorted_by_size[:30]:
+    from ghidra.program.model.address import Address
+    addr_obj = program.getAddressFactory().getAddress(f["address"])
+    if addr_obj:
+        func_obj = fm.getFunctionAt(addr_obj)
+        if func_obj:
+            decompile_targets.add(func_obj.getEntryPoint())
+
+# All interesting functions
+for cat in interesting.values():
+    for f in cat:
+        addr_obj = program.getAddressFactory().getAddress(f["address"])
+        if addr_obj:
+            func_obj = fm.getFunctionAt(addr_obj)
+            if func_obj:
+                decompile_targets.add(func_obj.getEntryPoint())
+
+# Decompile selected functions
+decompiled = []
+for addr in decompile_targets:
+    func = fm.getFunctionAt(addr)
+    if not func:
+        continue
     result = decomp.decompileFunction(func, 30, monitor)
     c_code = ""
     if result and result.decompileCompleted():
         c_code = result.getDecompiledFunction().getC()
 
-    results.append({
-        "name": name,
-        "address": addr,
-        "size": size,
-        "code": c_code[:3000] if c_code else ""
+    decompiled.append({
+        "name": func.getName(),
+        "address": str(func.getEntryPoint()),
+        "size": func.getBody().getNumAddresses(),
+        "code": c_code[:8000] if c_code else "",
+        "calling_conv": str(func.getCallingConventionName()) if func.getCallingConventionName() else "unknown"
     })
 
-# Save results
-import json
+# === Import/Export tables ===
+imports = []
+exports = []
+for sym in program.getSymbolTable().getAllSymbols(True):
+    if sym.isExternal():
+        imports.append(str(sym))
+    elif sym.getSource() == SourceType.DEFAULT and sym.getName() and not sym.getName().startswith("FUN_"):
+        pass  # Skip default labels
+
+for sym in program.getSymbolTable().getExternalSymbols():
+    imports.append(str(sym))
+
+# Save all results
+final = {
+    "total_functions": len(all_funcs),
+    "entry_point": entry_addr,
+    "functions": all_funcs[:500],
+    "decompiled": decompiled,
+    "call_graph": call_graph,
+    "interesting": {k: v for k, v in interesting.items() if v},
+    "imports": imports[:200],
+    "exports": exports[:100]
+}
+
 with open(output_dir + "/ghidra_results.json", "w") as f:
-    json.dump(results[:200], f)  # Limit to 200 functions
+    json.dump(final, f, default=str)
+
+print("[Ghidra] Done: %d functions, %d decompiled, %d interesting" % (
+    len(all_funcs), len(decompiled), sum(len(v) for v in interesting.values())), flush=True)
 """
         script_path = os.path.join(tmpdir, "analyze.py")
         with open(script_path, "w") as f:
@@ -570,17 +714,29 @@ with open(output_dir + "/ghidra_results.json", "w") as f:
                f"-scriptPath {tmpdir} "
                f"-deleteProject")
 
-        out, err, rc = run_cmd(cmd, timeout=300)
+        print(f"  [ghidra] Running analyzeHeadless on {fname}...", flush=True)
+        out, err, rc = run_cmd(cmd, timeout=600)
 
         ghidra_json = os.path.join(output_dir, "ghidra_results.json")
         if os.path.exists(ghidra_json):
             with open(ghidra_json) as f:
-                funcs = json.load(f)
-            result["functions"] = funcs
-            # Top 20 biggest functions with decompiled code
-            result["decompiled"] = sorted(funcs, key=lambda x: x.get("size", 0), reverse=True)[:20]
+                data = json.load(f)
+            result["functions"] = data.get("functions", [])
+            result["decompiled"] = data.get("decompiled", [])
+            result["call_graph"] = data.get("call_graph", {})
+            result["interesting_functions"] = data.get("interesting", {})
+            result["entry_point"] = data.get("entry_point")
+            result["total_functions"] = data.get("total_functions", 0)
+            result["import_table"] = data.get("imports", [])
+            result["export_table"] = data.get("exports", [])
+
+            total = result["total_functions"]
+            decompiled_count = len(result["decompiled"])
+            interesting_count = sum(len(v) for v in result["interesting_functions"].values())
+            print(f"  [ghidra] Done: {total} functions, {decompiled_count} decompiled, {interesting_count} interesting", flush=True)
         else:
             result["error"] = f"Ghidra failed: {err[:500]}" if err else "No output"
+            print(f"  [ghidra] FAILED: {err[:200]}", flush=True)
 
     return result
 
@@ -828,9 +984,10 @@ def process_task(task_file):
         elif file_type in ("APK",):
             output["results"]["apk"] = analyze_apk_deep(filepath, output)
 
-        # Ghidra decompile for native binaries (if deep_static or full)
-        if profile in ("deep_static", "full") and file_type in ("ELF", "PE", "SO", "DLL", ".NET", "Executable"):
+        # Ghidra decompile — always for native binaries (skip .NET → ILSpy)
+        if file_type in ("ELF", "PE", "SO", "DLL", "Executable"):
             if not output["results"].get("binary", {}).get("dotnet"):
+                print(f"  [task] Running Ghidra headless analysis...", flush=True)
                 output["results"]["ghidra"] = run_ghidra_decompile(filepath, output)
 
         # ============================================================
