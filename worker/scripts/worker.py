@@ -402,6 +402,109 @@ def analyze_apk_deep(filepath, output):
     return result
 
 
+def analyze_dotnet_deep(filepath, output):
+    """Deep .NET analysis with ILSpy decompilation → C# source code."""
+    result = {"decompiled": False, "namespaces": [], "classes": [], "source_files": [],
+              "resources": [], "dotnet_info": {}, "error": None}
+
+    # Get .NET metadata with pefile
+    try:
+        import pefile
+        pe = pefile.PE(filepath)
+        if hasattr(pe, 'DIRECTORY_ENTRY_COMIMAGE'):
+            clr = pe.DIRECTORY_ENTRY_COMIMAGE.struct
+            result["dotnet_info"] = {
+                "runtime_version": f"{clr.MajorRuntimeVersion}.{clr.MinorRuntimeVersion}",
+                "flags": clr.Flags,
+                "entry_point": hex(clr.EntryPointRVA) if clr.EntryPointRVA else None,
+            }
+        pe.close()
+    except Exception as e:
+        result["dotnet_info_error"] = str(e)
+
+    with tempfile.TemporaryDirectory(prefix="retool_dotnet_") as tmpdir:
+        out_dir = os.path.join(tmpdir, "decompiled")
+        os.makedirs(out_dir, exist_ok=True)
+
+        # Decompile with ILSpy
+        print(f"  [dotnet] Decompiling with ILSpy...", flush=True)
+        out, err, rc = run_cmd(
+            f"ilspycmd -p -o {out_dir} {filepath}",
+            timeout=300
+        )
+
+        if rc != 0:
+            # Try with just types (no resources)
+            out, err, rc = run_cmd(
+                f"ilspycmd -t -o {out_dir} {filepath}",
+                timeout=300
+            )
+
+        if rc == 0:
+            result["decompiled"] = True
+
+            # Collect all .cs files
+            cs_files = []
+            namespaces = set()
+            classes = []
+
+            for root, dirs, files in os.walk(out_dir):
+                for fname in files:
+                    full_path = os.path.join(root, fname)
+                    rel_path = os.path.relpath(full_path, out_dir)
+
+                    if fname.endswith(".cs"):
+                        try:
+                            with open(full_path, "r", errors="ignore") as f:
+                                content = f.read()
+
+                            # Extract namespace and class names
+                            import re
+                            ns_match = re.findall(r'namespace\s+([\w.]+)', content)
+                            cls_match = re.findall(r'(?:public|internal|private|protected)?\s*(?:static\s+)?(?:partial\s+)?(?:class|struct|interface|enum)\s+(\w+)', content)
+
+                            for ns in ns_match:
+                                namespaces.add(ns)
+                            for cls in cls_match:
+                                classes.append({"name": cls, "namespace": ns_match[0] if ns_match else "", "file": rel_path})
+
+                            cs_files.append({
+                                "path": rel_path,
+                                "content": content[:15000],  # Keep substantial code
+                                "size": len(content),
+                                "lines": content.count("\n")
+                            })
+                        except:
+                            pass
+
+            # Sort by importance: main/program files first, then by size
+            def file_priority(f):
+                name = f["path"].lower()
+                if "program" in name or "main" in name or "entry" in name:
+                    return 0
+                if "app" in name or "config" in name or "settings" in name:
+                    return 1
+                if "api" in name or "client" in name or "network" in name or "http" in name:
+                    return 2
+                if "auth" in name or "login" in name or "encrypt" in name:
+                    return 3
+                return 4
+
+            cs_files.sort(key=lambda x: (file_priority(x), -x["size"]))
+            result["source_files"] = cs_files[:100]  # Top 100 files
+            result["namespaces"] = sorted(namespaces)
+            result["classes"] = classes[:200]
+            result["total_cs_files"] = len(cs_files)
+            result["total_lines"] = sum(f["lines"] for f in cs_files)
+
+            print(f"  [dotnet] Decompiled {len(cs_files)} .cs files, {result['total_lines']} lines", flush=True)
+        else:
+            result["error"] = f"ILSpy failed: {err[:500]}" if err else "Unknown error"
+            print(f"  [dotnet] ILSpy failed: {err[:200]}", flush=True)
+
+    return result
+
+
 def run_ghidra_decompile(filepath, output):
     """Run Ghidra headless analysis."""
     result = {"functions": [], "decompiled": {}, "call_graph": {}, "error": None}
@@ -555,12 +658,19 @@ def process_task(task_file):
             output["results"]["binary"] = analyze_elf_deep(filepath, output)
         elif file_type in ("PE", "DLL", ".NET"):
             output["results"]["binary"] = analyze_pe_deep(filepath, output)
+            # .NET files always get ILSpy decompilation (no protection = full source)
+            pe_result = output["results"]["binary"]
+            if pe_result.get("dotnet"):
+                print(f"  [task] .NET detected — running ILSpy decompilation", flush=True)
+                output["results"]["dotnet"] = analyze_dotnet_deep(filepath, output)
         elif file_type in ("APK",):
             output["results"]["apk"] = analyze_apk_deep(filepath, output)
 
-        # Ghidra decompile for binaries (if deep_static or full)
+        # Ghidra decompile for native binaries (if deep_static or full)
         if profile in ("deep_static", "full") and file_type in ("ELF", "PE", "SO", "DLL", ".NET", "Executable"):
-            output["results"]["ghidra"] = run_ghidra_decompile(filepath, output)
+            # Skip Ghidra for .NET (ILSpy is better)
+            if not output["results"].get("binary", {}).get("dotnet"):
+                output["results"]["ghidra"] = run_ghidra_decompile(filepath, output)
 
         # Dynamic analysis
         if profile in ("dynamic", "full") and file_type in ("ELF", "PE", "SO", "Executable"):

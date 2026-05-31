@@ -390,6 +390,7 @@ function AnalysisDetail({ id, nav, addToast }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [tab, setTab] = useState('overview');
+  const [selectedSrcFile, setSelectedSrcFile] = useState(0);
   const [polling, setPolling] = useState(false);
 
   const load = async () => {
@@ -453,6 +454,14 @@ function AnalysisDetail({ id, nav, addToast }) {
 
   if (loading) return <Spinner />;
   if (!data) return <div className="text-red-400 text-center py-12">Không tìm thấy phân tích</div>;
+
+  const _wr = data.worker_results || {};
+  const _results = _wr.results || {};
+  const _dotnet = _results.dotnet || {};
+  const dotnetSourceFiles = Array.isArray(_dotnet.source_files) ? _dotnet.source_files : [];
+  const dotnetNamespaces = Array.isArray(_dotnet.namespaces) ? _dotnet.namespaces : [];
+  const dotnetClasses = Array.isArray(_dotnet.classes) ? _dotnet.classes : [];
+  const dotnetDecompiled = _dotnet.decompiled || false;
 
   const result = data.result || data;
   // Normalize: API may return objects instead of arrays
@@ -667,29 +676,105 @@ function AnalysisDetail({ id, nav, addToast }) {
         {/* Source Code */}
         {tab === 'source' && (
           <div className="space-y-6">
-            {keyFunctions.length > 0 && (
+            {/* .NET Decompiled Source */}
+            {dotnetDecompiled && dotnetSourceFiles.length > 0 ? (
               <div>
-                <h3 className="text-lg font-semibold text-white mb-3">⚡ Hàm chính</h3>
-                <div className="grid md:grid-cols-2 gap-2">
-                  {keyFunctions.map((f,i) => (
-                    <div key={i} className="bg-slate-900 rounded-lg px-4 py-2 text-sm">
-                      <span className="text-indigo-400 font-mono">{typeof f==='string'?f:f.name||JSON.stringify(f)}</span>
-                      {typeof f==='object'&&f.address && <span className="text-slate-500 ml-2">@{f.address}</span>}
+                <div className="flex flex-wrap items-center gap-3 mb-4">
+                  <h3 className="text-lg font-semibold text-white">💻 Mã nguồn C# (ILSpy Decompiled)</h3>
+                  <span className="px-2 py-0.5 bg-green-600/20 text-green-400 text-xs rounded-full">
+                    {_dotnet.total_cs_files || dotnetSourceFiles.length} files • {_dotnet.total_lines || '?'} dòng
+                  </span>
+                </div>
+
+                {/* Namespaces & Classes */}
+                {dotnetNamespaces.length > 0 && (
+                  <div className="mb-4">
+                    <p className="text-sm text-slate-400 mb-1">📦 Namespaces:</p>
+                    <div className="flex flex-wrap gap-1">
+                      {dotnetNamespaces.map((ns, i) => (
+                        <span key={i} className="px-2 py-0.5 bg-slate-800 text-indigo-300 text-xs rounded font-mono">{ns}</span>
+                      ))}
                     </div>
-                  ))}
+                  </div>
+                )}
+
+                {/* File selector + code viewer */}
+                <div className="flex flex-col lg:flex-row gap-3">
+                  {/* File list sidebar */}
+                  <div className="lg:w-64 flex-shrink-0">
+                    <p className="text-sm text-slate-400 mb-2">📁 Files ({dotnetSourceFiles.length}):</p>
+                    <div className="bg-slate-900 rounded-lg max-h-[600px] overflow-y-auto">
+                      {dotnetSourceFiles.map((sf, i) => (
+                        <button
+                          key={i}
+                          onClick={() => setSelectedSrcFile(i)}
+                          className={`w-full text-left px-3 py-2 text-xs font-mono border-b border-slate-800 transition-colors ${
+                            selectedSrcFile === i
+                              ? 'bg-indigo-600/20 text-indigo-300'
+                              : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+                          }`}
+                        >
+                          <div className="truncate">{sf.path}</div>
+                          <div className="text-slate-600 text-[10px]">{sf.lines} lines</div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Code viewer */}
+                  <div className="flex-1 min-w-0">
+                    {dotnetSourceFiles[selectedSrcFile] && (
+                      <div>
+                        <div className="flex items-center justify-between mb-2">
+                          <p className="text-sm text-indigo-400 font-mono truncate">{dotnetSourceFiles[selectedSrcFile].path}</p>
+                          <span className="text-xs text-slate-500">{dotnetSourceFiles[selectedSrcFile].lines} dòng</span>
+                        </div>
+                        <pre className="bg-slate-900 rounded-lg p-4 text-sm text-slate-300 overflow-auto max-h-[600px] font-mono whitespace-pre leading-relaxed">
+                          {dotnetSourceFiles[selectedSrcFile].content.split('\n').map((line, i) => (
+                            <div key={i} className="flex hover:bg-slate-800/50">
+                              <span className="text-slate-600 w-12 text-right pr-3 select-none flex-shrink-0">{i+1}</span>
+                              <span className="flex-1 break-all">{line}</span>
+                            </div>
+                          ))}
+                        </pre>
+                      </div>
+                    )}
+                  </div>
                 </div>
               </div>
+            ) : _dotnet.error ? (
+              <div className="bg-red-900/20 border border-red-500/30 rounded-xl p-4">
+                <p className="text-red-400 font-semibold">❌ Lỗi decompile .NET</p>
+                <p className="text-red-300 text-sm mt-1">{_dotnet.error}</p>
+              </div>
+            ) : (
+              <>
+                {/* Fallback: generic decompiled view */}
+                {keyFunctions.length > 0 && (
+                  <div>
+                    <h3 className="text-lg font-semibold text-white mb-3">⚡ Hàm chính</h3>
+                    <div className="grid md:grid-cols-2 gap-2">
+                      {keyFunctions.map((f,i) => (
+                        <div key={i} className="bg-slate-900 rounded-lg px-4 py-2 text-sm">
+                          <span className="text-indigo-400 font-mono">{typeof f==='string'?f:f.name||JSON.stringify(f)}</span>
+                          {typeof f==='object'&&f.address && <span className="text-slate-500 ml-2">@{f.address}</span>}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                <div>
+                  <h3 className="text-lg font-semibold text-white mb-3">💻 Mã nguồn (Decompiled)</h3>
+                  {decompiled ? (
+                    <pre className="bg-slate-900 rounded-lg p-4 text-sm text-slate-300 overflow-auto max-h-[500px] font-mono whitespace-pre-wrap leading-relaxed">
+                      {decompiled.split('\n').map((line, i) => (
+                        <div key={i} className="flex"><span className="text-slate-600 w-10 text-right pr-3 select-none flex-shrink-0">{i+1}</span><span className="flex-1">{line}</span></div>
+                      ))}
+                    </pre>
+                  ) : <p className="text-slate-500">Không có mã nguồn. Thử profile "deep_static" hoặc "full" cho native binaries.</p>}
+                </div>
+              </>
             )}
-            <div>
-              <h3 className="text-lg font-semibold text-white mb-3">💻 Mã nguồn (Decompiled)</h3>
-              {decompiled ? (
-                <pre className="bg-slate-900 rounded-lg p-4 text-sm text-slate-300 overflow-auto max-h-[500px] font-mono whitespace-pre-wrap leading-relaxed">
-                  {decompiled.split('\n').map((line, i) => (
-                    <div key={i} className="flex"><span className="text-slate-600 w-10 text-right pr-3 select-none flex-shrink-0">{i+1}</span><span className="flex-1">{line}</span></div>
-                  ))}
-                </pre>
-              ) : <p className="text-slate-500">Không có mã nguồn</p>}
-            </div>
           </div>
         )}
 

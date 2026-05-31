@@ -67,6 +67,19 @@ RUN ARCH=$(dpkg --print-architecture) && \
     mv /tmp/frida-server /opt/frida-server && \
     chmod +x /opt/frida-server
 
+# --- .NET SDK + ILSpy (for .NET/C# decompilation) ---
+RUN wget -q https://packages.microsoft.com/config/ubuntu/22.04/packages-microsoft-prod.deb -O /tmp/packages-microsoft-prod.deb && \
+    dpkg -i /tmp/packages-microsoft-prod.deb && \
+    rm /tmp/packages-microsoft-prod.deb && \
+    apt-get update && apt-get install -y dotnet-sdk-8.0 && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV DOTNET_CLI_TELEMETRY_OPTOUT=1
+ENV DOTNET_NOLOGO=1
+
+RUN dotnet tool install --global ilspycmd
+ENV PATH="/root/.dotnet/tools:${PATH}"
+
 # --- Create dirs ---
 RUN mkdir -p /data/input /data/output /opt/retool/scripts
 
