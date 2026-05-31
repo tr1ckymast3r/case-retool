@@ -583,9 +583,10 @@ with open(output_dir + "/ghidra_results.json", "w") as f:
 
 
 def run_dynamic_analysis(filepath, output):
-    """Run dynamic analysis with strace + network capture."""
+    """Run dynamic analysis — strace + Wine (for PE) + network capture + filesystem monitoring."""
     result = {"syscalls": {}, "file_ops": [], "network_ops": [], "process_tree": [],
-              "captured_strings": [], "error": None}
+              "captured_strings": [], "stdout": "", "stderr": "", "error": None,
+              "wine_output": None, "network_capture": None}
 
     with tempfile.TemporaryDirectory(prefix="retool_dyn_") as tmpdir:
         fname = os.path.basename(filepath)
@@ -593,53 +594,165 @@ def run_dynamic_analysis(filepath, output):
         shutil.copy2(filepath, work_file)
         os.chmod(work_file, 0o755)
 
-        # strace
-        strace_out = os.path.join(tmpdir, "strace.txt")
-        run_cmd(f"timeout 15 strace -f -o {strace_out} {work_file}", timeout=20)
+        # Detect if it's a PE (Windows) or ELF (Linux)
+        with open(filepath, "rb") as f:
+            magic_bytes = f.read(4)
+        is_pe = magic_bytes[:2] == b"MZ"
 
-        if os.path.exists(strace_out):
-            with open(strace_out, "r", errors="ignore") as f:
-                strace_data = f.read(500000)
+        import re
+        from collections import Counter
 
-            # Parse syscalls
-            import re
-            from collections import Counter
-            syscall_pattern = re.compile(r'^(\w+)\(')
-            syscall_counts = Counter()
-            for line in strace_data.split("\n"):
-                m = syscall_pattern.search(line)
-                if m:
-                    syscall_counts[m.group(1)] += 1
+        # === Start network capture in background ===
+        pcap_file = os.path.join(tmpdir, "capture.pcap")
+        tcpdump_proc = subprocess.Popen(
+            ["tcpdump", "-i", "any", "-w", pcap_file, "-c", "1000"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
 
-            result["syscalls"] = dict(syscall_counts.most_common(30))
+        # === Snapshot filesystem for diff ===
+        snapshot_dirs = ["/tmp", "/var/tmp"]
+        fs_before = {}
+        for d in snapshot_dirs:
+            if os.path.exists(d):
+                for root, dirs, files in os.walk(d):
+                    for f in files:
+                        fp = os.path.join(root, f)
+                        try:
+                            fs_before[fp] = os.path.getmtime(fp)
+                        except:
+                            pass
 
-            # File operations
-            for line in strace_data.split("\n"):
-                if any(op in line for op in ["open(", "openat(", "unlink(", "rename("]):
-                    result["file_ops"].append(line[:200])
-                if any(op in line for op in ["connect(", "sendto(", "recvfrom(", "socket("]):
-                    result["network_ops"].append(line[:200])
+        if is_pe:
+            # === Windows PE → Run with Wine under strace ===
+            print(f"  [dynamic] Running PE with Wine + strace...", flush=True)
+            strace_out = os.path.join(tmpdir, "strace.txt")
+            stdout_out = os.path.join(tmpdir, "stdout.txt")
+            stderr_out = os.path.join(tmpdir, "stderr.txt")
 
-            result["file_ops"] = result["file_ops"][:50]
-            result["network_ops"] = result["network_ops"][:30]
+            # Set up Wine prefix
+            wine_prefix = os.path.join(tmpdir, "wineprefix")
+            env = f"WINEPREFIX={wine_prefix} WINEDEBUG=-all DISPLAY=:99"
 
-        # Capture output strings
-        stdout_out = os.path.join(tmpdir, "stdout.txt")
-        stderr_out = os.path.join(tmpdir, "stderr.txt")
-        run_cmd(f"timeout 10 {work_file} > {stdout_out} 2> {stderr_out}", timeout=15)
+            # Run with Wine under strace
+            run_cmd(f"{env} timeout 20 strace -f -o {strace_out} wine '{work_file}' > {stdout_out} 2> {stderr_out}", timeout=30)
 
-        if os.path.exists(stdout_out):
-            with open(stdout_out, "r", errors="ignore") as f:
-                result["stdout"] = f.read(5000)
-        if os.path.exists(stderr_out):
-            with open(stderr_out, "r", errors="ignore") as f:
-                result["stderr"] = f.read(5000)
+            # Also try direct Wine for output capture
+            wine_out, wine_err, wine_rc = run_cmd(f"{env} timeout 15 wine '{work_file}'", timeout=20)
+            result["wine_output"] = {"stdout": wine_out[:5000], "stderr": wine_err[:5000], "rc": wine_rc}
+
+            # Collect Wine-created files
+            wine_files = []
+            if os.path.exists(wine_prefix):
+                for root, dirs, files in os.walk(wine_prefix):
+                    for f in files:
+                        fp = os.path.join(root, f)
+                        try:
+                            size = os.path.getsize(fp)
+                            if size > 0:
+                                wine_files.append({"path": fp, "size": size})
+                        except:
+                            pass
+            result["wine_files_created"] = len(wine_files)
+
+            # Read strace
+            if os.path.exists(strace_out):
+                with open(strace_out, "r", errors="ignore") as f:
+                    strace_data = f.read(500000)
+
+                syscall_pattern = re.compile(r'^(\w+)\(')
+                syscall_counts = Counter()
+                for line in strace_data.split("\n"):
+                    m = syscall_pattern.search(line)
+                    if m:
+                        syscall_counts[m.group(1)] += 1
+                result["syscalls"] = dict(syscall_counts.most_common(30))
+
+                for line in strace_data.split("\n"):
+                    if any(op in line for op in ["open(", "openat(", "unlink(", "rename("]):
+                        result["file_ops"].append(line[:200])
+                    if any(op in line for op in ["connect(", "sendto(", "recvfrom(", "socket("]):
+                        result["network_ops"].append(line[:200])
+                result["file_ops"] = result["file_ops"][:50]
+                result["network_ops"] = result["network_ops"][:30]
+
+            # Read stdout/stderr
+            if os.path.exists(stdout_out):
+                with open(stdout_out, "r", errors="ignore") as f:
+                    result["stdout"] = f.read(5000)
+            if os.path.exists(stderr_out):
+                with open(stderr_out, "r", errors="ignore") as f:
+                    result["stderr"] = f.read(5000)
+
+        else:
+            # === Native ELF → Run with strace ===
+            print(f"  [dynamic] Running ELF with strace...", flush=True)
+            strace_out = os.path.join(tmpdir, "strace.txt")
+            run_cmd(f"timeout 15 strace -f -o {strace_out} {work_file}", timeout=20)
+
+            if os.path.exists(strace_out):
+                with open(strace_out, "r", errors="ignore") as f:
+                    strace_data = f.read(500000)
+
+                syscall_pattern = re.compile(r'^(\w+)\(')
+                syscall_counts = Counter()
+                for line in strace_data.split("\n"):
+                    m = syscall_pattern.search(line)
+                    if m:
+                        syscall_counts[m.group(1)] += 1
+                result["syscalls"] = dict(syscall_counts.most_common(30))
+
+                for line in strace_data.split("\n"):
+                    if any(op in line for op in ["open(", "openat(", "unlink(", "rename("]):
+                        result["file_ops"].append(line[:200])
+                    if any(op in line for op in ["connect(", "sendto(", "recvfrom(", "socket("]):
+                        result["network_ops"].append(line[:200])
+                result["file_ops"] = result["file_ops"][:50]
+                result["network_ops"] = result["network_ops"][:30]
+
+            # stdout/stderr
+            stdout_out = os.path.join(tmpdir, "stdout.txt")
+            stderr_out = os.path.join(tmpdir, "stderr.txt")
+            run_cmd(f"timeout 10 {work_file} > {stdout_out} 2> {stderr_out}", timeout=15)
+
+            if os.path.exists(stdout_out):
+                with open(stdout_out, "r", errors="ignore") as f:
+                    result["stdout"] = f.read(5000)
+            if os.path.exists(stderr_out):
+                with open(stderr_out, "r", errors="ignore") as f:
+                    result["stderr"] = f.read(5000)
+
+        # === Stop network capture ===
+        tcpdump_proc.terminate()
+        tcpdump_proc.wait(timeout=5)
+
+        # Parse pcap summary
+        if os.path.exists(pcap_file) and os.path.getsize(pcap_file) > 0:
+            out, _, rc = run_cmd(f"tcpdump -r {pcap_file} -nn 2>/dev/null | head -50")
+            result["network_capture"] = {
+                "pcap_size": os.path.getsize(pcap_file),
+                "summary": out[:3000]
+            }
+
+        # === Check filesystem changes ===
+        fs_changes = []
+        for d in snapshot_dirs:
+            if os.path.exists(d):
+                for root, dirs, files in os.walk(d):
+                    for f in files:
+                        fp = os.path.join(root, f)
+                        try:
+                            mtime = os.path.getmtime(fp)
+                            if fp not in fs_before or fs_before[fp] != mtime:
+                                fs_changes.append(fp)
+                        except:
+                            pass
+        result["filesystem_changes"] = fs_changes[:20]
 
     return result
 
 
 def process_task(task_file):
-    """Process a single analysis task."""
+    """Process a single analysis task — with auto-extraction and recursive analysis."""
     with open(task_file) as f:
         task = json.load(f)
 
@@ -648,17 +761,63 @@ def process_task(task_file):
     profile = task.get("profile", "quick_scan")
     file_type = task.get("file_type", "Unknown")
 
-    output = {"id": analysis_id, "results": {}, "errors": []}
+    output = {"id": analysis_id, "results": {}, "errors": [], "extraction": None, "children": []}
 
     try:
-        # Always run type-specific deep analysis
+        # ============================================================
+        # PHASE 1: Auto-detect + Extract (always, for all PE files)
+        # ============================================================
+        if file_type in ("PE", "DLL"):
+            from extractor import auto_extract
+            extract_result = auto_extract(filepath, str(OUTPUT_DIR / analysis_id))
+            output["extraction"] = {
+                "detection": extract_result["detection"],
+                "method": extract_result.get("extraction_method"),
+                "total_extracted": extract_result.get("total_extracted", 0),
+                "total_interesting": extract_result.get("total_interesting", 0),
+            }
+
+            # ============================================================
+            # PHASE 2: Analyze extracted payload (recursive)
+            # ============================================================
+            interesting = extract_result.get("interesting_files", [])
+            if interesting:
+                print(f"  [task] Analyzing {len(interesting)} extracted files...", flush=True)
+                # Sort by importance: executables first, then DLLs, then configs
+                def file_importance(fp):
+                    ext = os.path.splitext(fp)[1].lower()
+                    if ext in ('.exe', '.dll', '.sys', '.msi'): return 0
+                    if ext in ('.so', '.dylib', '.elf'): return 1
+                    if ext in ('.jar', '.class', '.py', '.bat', '.cmd', '.ps1'): return 2
+                    if ext in ('.config', '.xml', '.json', '.ini'): return 3
+                    return 4
+
+                interesting.sort(key=file_importance)
+
+                for i, ext_file in enumerate(interesting[:20]):  # Max 20 files
+                    try:
+                        child = analyze_extracted_file(ext_file, i)
+                        if child:
+                            output["children"].append(child)
+                    except Exception as e:
+                        print(f"  [task] Error analyzing {ext_file}: {e}", flush=True)
+
+                print(f"  [task] Analyzed {len(output['children'])} extracted files", flush=True)
+
+            # If extraction found interesting content, update the detection
+            if extract_result["detection"].get("sub_type") in ("dotnet",):
+                file_type = ".NET"
+
+        # ============================================================
+        # PHASE 3: Main file analysis
+        # ============================================================
         if file_type in ("DEB",):
             output["results"]["package"] = analyze_deb(filepath, output)
         elif file_type in ("ELF", "SO", "Executable"):
             output["results"]["binary"] = analyze_elf_deep(filepath, output)
         elif file_type in ("PE", "DLL", ".NET"):
             output["results"]["binary"] = analyze_pe_deep(filepath, output)
-            # .NET files always get ILSpy decompilation (no protection = full source)
+            # .NET files always get ILSpy decompilation
             pe_result = output["results"]["binary"]
             if pe_result.get("dotnet"):
                 print(f"  [task] .NET detected — running ILSpy decompilation", flush=True)
@@ -668,13 +827,26 @@ def process_task(task_file):
 
         # Ghidra decompile for native binaries (if deep_static or full)
         if profile in ("deep_static", "full") and file_type in ("ELF", "PE", "SO", "DLL", ".NET", "Executable"):
-            # Skip Ghidra for .NET (ILSpy is better)
             if not output["results"].get("binary", {}).get("dotnet"):
                 output["results"]["ghidra"] = run_ghidra_decompile(filepath, output)
 
-        # Dynamic analysis
-        if profile in ("dynamic", "full") and file_type in ("ELF", "PE", "SO", "Executable"):
+        # ============================================================
+        # PHASE 4: Dynamic analysis — run with full monitoring
+        # ============================================================
+        if file_type in ("PE", "ELF", "SO", "Executable", "DLL"):
+            print(f"  [task] Running dynamic analysis...", flush=True)
             output["results"]["dynamic"] = run_dynamic_analysis(filepath, output)
+
+        # ============================================================
+        # PHASE 5: Also analyze unpacked file if UPX was used
+        # ============================================================
+        if output.get("extraction", {}).get("method") == "unpack":
+            extract_dir = str(OUTPUT_DIR / analysis_id / "extracted")
+            unpacked = [f for f in os.listdir(extract_dir) if f.endswith(".unpacked")] if os.path.exists(extract_dir) else []
+            if unpacked:
+                unpacked_path = os.path.join(extract_dir, unpacked[0])
+                print(f"  [task] Analyzing unpacked binary: {unpacked[0]}", flush=True)
+                output["results"]["unpacked_binary"] = analyze_pe_deep(unpacked_path, output) if file_type in ("PE", "DLL") else analyze_elf_deep(unpacked_path, output)
 
         output["status"] = "completed"
     except Exception as e:
@@ -691,6 +863,79 @@ def process_task(task_file):
     os.remove(task_file)
 
     return output
+
+
+def analyze_extracted_file(filepath, index):
+    """Analyze a single extracted file — returns child analysis dict."""
+    import magic
+
+    try:
+        mime = magic.from_file(filepath, mime=True)
+        ftype = magic.from_file(filepath)
+    except:
+        mime = "unknown"
+        ftype = "unknown"
+
+    fname = os.path.basename(filepath)
+    fsize = os.path.getsize(filepath) if os.path.exists(filepath) else 0
+
+    child = {
+        "index": index,
+        "filename": fname,
+        "path": filepath,
+        "size": fsize,
+        "type": ftype,
+        "mime": mime,
+        "results": {}
+    }
+
+    # Get strings
+    out, _, _ = run_cmd(f"strings -n 8 '{filepath}' | head -500")
+    child["strings_sample"] = out[:3000]
+
+    # Detect if it's a binary
+    if mime and ("executable" in mime or "sharedlib" in mime or "x-executable" in mime or "octet-stream" in mime):
+        # PE check
+        with open(filepath, "rb") as f:
+            magic_bytes = f.read(4)
+
+        if magic_bytes[:2] == b"MZ":
+            child["file_type"] = "PE"
+            child["results"]["binary"] = analyze_pe_deep(filepath, {})
+
+            # Check .NET
+            if child["results"]["binary"].get("dotnet"):
+                print(f"    [child] .NET payload found: {fname}", flush=True)
+                child["results"]["dotnet"] = analyze_dotnet_deep(filepath, {})
+
+        elif magic_bytes[:4] == b"\x7fELF":
+            child["file_type"] = "ELF"
+            child["results"]["binary"] = analyze_elf_deep(filepath, {})
+
+        # Ghidra for interesting binaries
+        if fsize > 10_000 and fsize < 50_000_000:
+            try:
+                child["results"]["ghidra"] = run_ghidra_decompile(filepath, {})
+            except:
+                pass
+
+    elif fname.endswith((".config", ".xml", ".json", ".ini", ".cfg", ".yaml")):
+        child["file_type"] = "config"
+        try:
+            with open(filepath, "r", errors="ignore") as f:
+                child["content"] = f.read(10000)
+        except:
+            pass
+
+    elif fname.endswith((".bat", ".cmd", ".ps1", ".vbs", ".js", ".py", ".sh")):
+        child["file_type"] = "script"
+        try:
+            with open(filepath, "r", errors="ignore") as f:
+                child["content"] = f.read(20000)
+        except:
+            pass
+
+    return child
 
 
 def main():

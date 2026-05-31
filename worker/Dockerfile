@@ -9,11 +9,12 @@ RUN apt-get update && apt-get install -y \
     wget curl git unzip xz-utils file \
     strace ltrace tcpdump binutils \
     openjdk-17-jdk-headless \
-    python3 python3-pip \
+    python3 python3-pip python3-magic \
     net-tools iproute2 \
     p7zip-full binutils \
     libssl-dev libffi-dev \
     zstd \
+    innoextract binwalk upx-ucl wine64 \
     && rm -rf /var/lib/apt/lists/*
 
 # --- Ghidra (headless decompiler) ---

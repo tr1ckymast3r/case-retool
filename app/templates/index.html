@@ -603,10 +603,87 @@ function AnalysisDetail({ id, nav, addToast }) {
                 </div>
               </div>
             )}
+
+            {/* Extraction Results */}
+            {data.worker_results && data.worker_results.extraction && (
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-2">📦 Auto-Extraction</h3>
+                <div className="bg-slate-900 rounded-lg p-4">
+                  {(() => {
+                    const ext = data.worker_results.extraction;
+                    const det = ext.detection || {};
+                    return (
+                      <div className="space-y-2 text-sm">
+                        <p className="text-slate-300"><span className="text-slate-500">Phát hiện:</span> <span className="text-indigo-400 font-mono">{det.sub_type || det.type || 'unknown'}</span> ({det.confidence || 0}% confidence)</p>
+                        <p className="text-slate-300"><span className="text-slate-500">Phương pháp:</span> {ext.method || 'none'}</p>
+                        <p className="text-slate-300"><span className="text-slate-500">Files extracted:</span> <span className="text-green-400 font-bold">{ext.total_extracted || 0}</span> ({ext.total_interesting || 0} interesting)</p>
+                      </div>
+                    );
+                  })()}
+                </div>
+              </div>
+            )}
+
+            {/* Extracted Payload Analysis */}
+            {data.worker_results && Array.isArray(data.worker_results.children) && data.worker_results.children.length > 0 && (
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-2">🔬 Payload Analysis ({data.worker_results.children.length} files)</h3>
+                <div className="space-y-3">
+                  {data.worker_results.children.map((child, ci) => (
+                    <div key={ci} className="bg-slate-900 rounded-lg p-4 border border-slate-700">
+                      <div className="flex items-center justify-between mb-2">
+                        <div className="flex items-center gap-2">
+                          <span className="text-indigo-400 font-mono text-sm font-bold">{child.filename}</span>
+                          {child.file_type && <span className="px-2 py-0.5 bg-blue-600/20 text-blue-400 text-xs rounded">{child.file_type}</span>}
+                          {child.results && child.results.dotnet && child.results.dotnet.decompiled && (
+                            <span className="px-2 py-0.5 bg-green-600/20 text-green-400 text-xs rounded">✓ .NET Decompiled</span>
+                          )}
+                        </div>
+                        <span className="text-slate-500 text-xs">{child.size ? `${(child.size/1024).toFixed(1)} KB` : ''}</span>
+                      </div>
+
+                      {/* Binary info */}
+                      {child.results && child.results.binary && (
+                        <div className="text-xs text-slate-400 mb-2">
+                          {child.results.binary.language && <span>Language: <span className="text-slate-300">{child.results.binary.language}</span> • </span>}
+                          {child.results.binary.sections && <span>{child.results.binary.sections.length} sections • </span>}
+                          {child.results.binary.imports && <span>{child.results.binary.imports.length} imports</span>}
+                        </div>
+                      )}
+
+                      {/* .NET Namespaces */}
+                      {child.results && child.results.dotnet && child.results.dotnet.namespaces && child.results.dotnet.namespaces.length > 0 && (
+                        <div className="mb-2">
+                          <div className="flex flex-wrap gap-1">
+                            {child.results.dotnet.namespaces.map((ns, ni) => (
+                              <span key={ni} className="px-1.5 py-0.5 bg-slate-800 text-indigo-300 text-[10px] rounded font-mono">{ns}</span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Key strings */}
+                      {child.strings_sample && (
+                        <details className="text-xs">
+                          <summary className="text-slate-500 cursor-pointer hover:text-slate-400">Strings sample...</summary>
+                          <pre className="mt-1 bg-slate-800 rounded p-2 text-slate-400 overflow-auto max-h-[200px] font-mono whitespace-pre">{child.strings_sample.slice(0, 2000)}</pre>
+                        </details>
+                      )}
+
+                      {/* Script/Config content */}
+                      {child.content && (
+                        <details className="text-xs">
+                          <summary className="text-slate-500 cursor-pointer hover:text-slate-400">Content preview...</summary>
+                          <pre className="mt-1 bg-slate-800 rounded p-2 text-slate-400 overflow-auto max-h-[300px] font-mono whitespace-pre">{child.content.slice(0, 5000)}</pre>
+                        </details>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         )}
-
-        {/* Architecture */}
         {tab === 'architecture' && (
           <div className="space-y-6">
             {dependencies.length > 0 && (
