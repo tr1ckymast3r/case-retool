@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y \
     net-tools iproute2 \
     p7zip-full binutils \
     libssl-dev libffi-dev \
+    zstd \
     && rm -rf /var/lib/apt/lists/*
 
 # --- Ghidra (headless decompiler) ---

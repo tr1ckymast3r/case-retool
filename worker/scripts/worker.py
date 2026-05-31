@@ -40,14 +40,39 @@ def analyze_deb(filepath, output):
             result["error"] = f"ar extraction failed: {err}"
             return result
 
+        print(f"  [deb] ar extracted: {os.listdir(tmpdir)}", flush=True)
+
+        # Helper to extract tar (handles .gz, .xz, .zst, .bz2)
+        def extract_tar(tar_path, dest_dir):
+            os.makedirs(dest_dir, exist_ok=True)
+            # Try with auto-detect first
+            out, err, rc = run_cmd(f"tar xf {tar_path} -C {dest_dir}", timeout=60)
+            if rc != 0:
+                # Fallback: try with explicit flags
+                if tar_path.endswith(".zst"):
+                    run_cmd(f"zstd -d {tar_path} -o {tar_path.replace('.zst', '')}", timeout=30)
+                    uncompressed = tar_path.replace(".zst", "")
+                    if os.path.exists(uncompressed):
+                        run_cmd(f"tar xf {uncompressed} -C {dest_dir}", timeout=60)
+                elif tar_path.endswith(".xz"):
+                    run_cmd(f"xz -d {tar_path}", timeout=30)
+                    uncompressed = tar_path.replace(".xz", "")
+                    if os.path.exists(uncompressed):
+                        run_cmd(f"tar xf {uncompressed} -C {dest_dir}", timeout=60)
+            return os.path.exists(dest_dir) and len(os.listdir(dest_dir)) > 0
+
         # Parse control
         for f in os.listdir(tmpdir):
             if f.startswith("control.tar"):
                 control_dir = os.path.join(tmpdir, "control")
-                os.makedirs(control_dir, exist_ok=True)
-                run_cmd(f"tar xf {os.path.join(tmpdir, f)} -C {control_dir}")
+                tar_path = os.path.join(tmpdir, f)
+                print(f"  [deb] Extracting control: {f}", flush=True)
+                extract_tar(tar_path, control_dir)
 
                 control_path = os.path.join(control_dir, "control")
+                if not os.path.exists(control_path):
+                    # Try in DEBIAN subdirectory
+                    control_path = os.path.join(control_dir, "DEBIAN", "control")
                 if os.path.exists(control_path):
                     with open(control_path) as cf:
                         current_key = None
@@ -64,10 +89,13 @@ def analyze_deb(filepath, output):
                     deps = result["package_info"].get("Depends", "")
                     if deps:
                         result["dependencies"] = [d.strip().split("(")[0].strip() for d in deps.split(",")]
+                    print(f"  [deb] Package: {result['package_info'].get('Package', '?')} v{result['package_info'].get('Version', '?')}", flush=True)
 
                 # Read install scripts
                 for script in ["preinst", "postinst", "prerm", "postrm"]:
                     spath = os.path.join(control_dir, script)
+                    if not os.path.exists(spath):
+                        spath = os.path.join(control_dir, "DEBIAN", script)
                     if os.path.exists(spath):
                         with open(spath) as sf:
                             result["scripts"][script] = sf.read(10000)
@@ -76,8 +104,9 @@ def analyze_deb(filepath, output):
         for f in os.listdir(tmpdir):
             if f.startswith("data.tar"):
                 data_dir = os.path.join(tmpdir, "data")
-                os.makedirs(data_dir, exist_ok=True)
-                run_cmd(f"tar xf {os.path.join(tmpdir, f)} -C {data_dir}")
+                tar_path = os.path.join(tmpdir, f)
+                print(f"  [deb] Extracting data: {f}", flush=True)
+                extract_tar(tar_path, data_dir)
 
                 for root, dirs, files in os.walk(data_dir):
                     for fname in files:
