@@ -9,7 +9,7 @@ services:
       - retool-reports:/app/reports
       - retool-db:/app/data
     environment:
-      - DATABASE_URL=sqlite:///app/data/retool.db
+      - DATABASE_URL=sqlite:////app/data/retool.db
       - WORKER_DATA_DIR=/data
       - PYTHONUNBUFFERED=1
     depends_on:

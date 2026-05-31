@@ -27,8 +27,13 @@ async def lifespan(app: FastAPI):
     os.makedirs(settings.WORKER_INPUT, exist_ok=True)
     os.makedirs(settings.WORKER_OUTPUT, exist_ok=True)
 
-    # Ensure DB directory exists
-    db_dir = os.path.dirname(settings.DATABASE_URL.replace("sqlite:///", ""))
+    # Ensure DB directory exists (handle both sqlite:/// and sqlite:////)
+    db_path = settings.DATABASE_URL
+    if db_path.startswith("sqlite:////"):
+        db_path = db_path.replace("sqlite://", "")  # → /app/data/retool.db
+    else:
+        db_path = db_path.replace("sqlite:///", "")  # → app/data/retool.db
+    db_dir = os.path.dirname(db_path)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
 
