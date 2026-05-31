@@ -76,8 +76,9 @@ RUN wget -q https://packages.microsoft.com/config/ubuntu/22.04/packages-microsof
 
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1
 ENV DOTNET_NOLOGO=1
+ENV DOTNET_ROLL_FORWARD=LatestMajor
 
-RUN dotnet tool install --global ilspycmd
+RUN dotnet tool install --global ilspycmd --version 8.2.0.7535
 ENV PATH="/root/.dotnet/tools:${PATH}"
 
 # --- Create dirs ---
