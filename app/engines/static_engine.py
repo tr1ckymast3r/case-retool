@@ -13,7 +13,7 @@ import json
 import magic  # python-magic
 from datetime import datetime
 
-from ..models import Analysis
+from app.models import Analysis
 
 
 def detect_file_type(filepath: str) -> dict:
@@ -89,7 +89,7 @@ def detect_file_type(filepath: str) -> dict:
         return result
 
     # DEB (Debian package) — `!<arch>` magic
-    if header[:7] == b"!<arch>\n":
+    if header[:8] == b"!<arch>\n":
         # Check for debian-binary inside
         try:
             with open(filepath, "rb") as f:
@@ -507,7 +507,7 @@ def run_local_analysis(analysis: Analysis, db) -> None:
 
 def merge_worker_results(analysis_id: str, worker_result: dict, db) -> None:
     """Merge worker deep analysis results into the analysis record."""
-    from ..database import SessionLocal
+    from app.database import SessionLocal
 
     # Open a new session since we're in a background thread
     session = SessionLocal()
@@ -516,57 +516,180 @@ def merge_worker_results(analysis_id: str, worker_result: dict, db) -> None:
         if not analysis:
             return
 
-        # Merge worker results
-        if "tech_stack" in worker_result and worker_result["tech_stack"]:
-            existing = json.loads(analysis.tech_stack or "{}")
-            existing.update(worker_result["tech_stack"])
-            analysis.tech_stack = json.dumps(existing)
+        # Worker returns: {id, results: {binary/package/apk/ghidra/dynamic}, status}
+        results = worker_result.get("results", {})
 
-        if "architecture" in worker_result and worker_result["architecture"]:
-            existing = json.loads(analysis.architecture or "{}")
-            existing.update(worker_result["architecture"])
-            analysis.architecture = json.dumps(existing)
+        # --- Merge ELF/PE binary analysis ---
+        binary = results.get("binary", {})
+        if binary:
+            # Update tech stack with language/framework detected by worker
+            existing_ts = json.loads(analysis.tech_stack or "{}")
+            if binary.get("language") and binary["language"] != "unknown":
+                existing_ts["language"] = binary["language"]
+            if binary.get("framework") and binary["framework"] != "unknown":
+                existing_ts["framework"] = binary["framework"]
+            analysis.tech_stack = json.dumps(existing_ts)
 
-        if "features" in worker_result and worker_result["features"]:
-            existing = json.loads(analysis.features or "{}")
-            existing.update(worker_result["features"])
-            analysis.features = json.dumps(existing)
+            # Store shared libraries as dependencies
+            existing_deps = json.loads(analysis.dependencies or "[]")
+            shared_libs = binary.get("shared_libs", "")
+            if shared_libs:
+                for line in shared_libs.strip().split("\n"):
+                    line = line.strip()
+                    if "=>" in line:
+                        lib_name = line.split("=>")[0].strip()
+                        if lib_name:
+                            existing_deps.append({"name": lib_name, "type": "shared_library"})
+            analysis.dependencies = json.dumps(existing_deps)
 
-        if "api_endpoints" in worker_result and worker_result["api_endpoints"]:
-            analysis.api_endpoints = json.dumps(worker_result["api_endpoints"])
+            # Store categorized strings in features
+            existing_features = json.loads(analysis.features or "{}")
+            if binary.get("strings_categorized"):
+                existing_features["worker_strings"] = binary["strings_categorized"]
+            if binary.get("crypto_detected"):
+                existing_features["crypto_detected"] = binary["crypto_detected"]
+            if binary.get("network_libs"):
+                existing_features["network_libs"] = binary["network_libs"]
+            if binary.get("persistence_mechanisms"):
+                existing_features["persistence_mechanisms"] = binary["persistence_mechanisms"]
+            analysis.features = json.dumps(existing_features)
 
-        if "dependencies" in worker_result and worker_result["dependencies"]:
-            existing = json.loads(analysis.dependencies or "[]")
-            existing.extend(worker_result["dependencies"])
-            # Deduplicate by name
-            seen = set()
-            unique = []
-            for d in existing:
-                name = d.get("name", "") if isinstance(d, dict) else str(d)
-                if name not in seen:
-                    seen.add(name)
-                    unique.append(d)
-            analysis.dependencies = json.dumps(unique)
+            # Store disassembly in decompiled_code
+            decompiled = {}
+            if binary.get("disassembly_sample"):
+                decompiled["disassembly"] = binary["disassembly_sample"][:10000]
+            if binary.get("header"):
+                decompiled["elf_header"] = binary["header"]
+            if binary.get("sections_raw"):
+                decompiled["sections"] = binary["sections_raw"][:5000]
+            if binary.get("dynamic_symbols"):
+                decompiled["dynamic_symbols"] = binary["dynamic_symbols"][:5000]
+            if decompiled:
+                analysis.decompiled_code = json.dumps(decompiled)
 
-        if "data_models" in worker_result and worker_result["data_models"]:
-            analysis.data_models = json.dumps(worker_result["data_models"])
+            # Store architecture info
+            existing_arch = json.loads(analysis.architecture or "{}")
+            if binary.get("header"):
+                # Extract entry point and other info from ELF header
+                for line in binary["header"].split("\n"):
+                    if "Entry point" in line:
+                        existing_arch["entry_point"] = line.split(":")[-1].strip()
+            analysis.architecture = json.dumps(existing_arch)
 
-        if "network_activity" in worker_result and worker_result["network_activity"]:
-            analysis.network_activity = json.dumps(worker_result["network_activity"])
+        # --- Merge DEB package analysis ---
+        package = results.get("package", {})
+        if package:
+            existing_ts = json.loads(analysis.tech_stack or "{}")
+            if package.get("package_info"):
+                pi = package["package_info"]
+                existing_ts["package_name"] = pi.get("Package", "")
+                existing_ts["package_version"] = pi.get("Version", "")
+                existing_ts["package_arch"] = pi.get("Architecture", "")
+                existing_ts["package_maintainer"] = pi.get("Maintainer", "")
+            analysis.tech_stack = json.dumps(existing_ts)
 
-        if "decompiled_code" in worker_result and worker_result["decompiled_code"]:
-            analysis.decompiled_code = json.dumps(worker_result["decompiled_code"])
+            if package.get("dependencies"):
+                existing_deps = json.loads(analysis.dependencies or "[]")
+                for dep in package["dependencies"]:
+                    existing_deps.append({"name": dep, "type": "deb_dependency"})
+                analysis.dependencies = json.dumps(existing_deps)
 
-        if "config_values" in worker_result and worker_result["config_values"]:
-            analysis.config_values = json.dumps(worker_result["config_values"])
+            # Store scripts (preinst, postinst, etc.)
+            if package.get("scripts"):
+                existing_features = json.loads(analysis.features or "{}")
+                existing_features["install_scripts"] = package["scripts"]
+                analysis.features = json.dumps(existing_features)
 
+            # Store file list
+            if package.get("files"):
+                existing_features = json.loads(analysis.features or "{}")
+                existing_features["package_files"] = [
+                    {"path": f.get("path", ""), "size": f.get("size", 0), "type": f.get("type", "")}
+                    for f in package["files"][:200]
+                ]
+                existing_features["binary_files"] = [
+                    {"path": f.get("path", ""), "file_info": f.get("file_info", "")}
+                    for f in package.get("binaries", [])
+                ]
+                existing_features["config_files"] = [
+                    {"path": f.get("path", ""), "content_preview": f.get("content_preview", "")[:500]}
+                    for f in package.get("configs", [])
+                ]
+                existing_features["service_files"] = [
+                    {"path": f.get("path", ""), "content": f.get("content", "")[:500]}
+                    for f in package.get("services", [])
+                ]
+                analysis.features = json.dumps(existing_features)
+
+            # Store decompiled code from binaries in package
+            if package.get("binaries"):
+                decompiled = json.loads(analysis.decompiled_code or "{}")
+                decompiled["package_binaries"] = [
+                    {"path": b.get("path", ""), "file_info": b.get("file_info", ""), "strings_sample": b.get("strings_sample", "")[:2000]}
+                    for b in package["binaries"][:20]
+                ]
+                analysis.decompiled_code = json.dumps(decompiled)
+
+        # --- Merge APK analysis ---
+        apk = results.get("apk", {})
+        if apk:
+            existing_features = json.loads(analysis.features or "{}")
+            if apk.get("permissions"):
+                existing_features["permissions"] = apk["permissions"]
+            if apk.get("activities"):
+                existing_features["activities"] = apk["activities"]
+            if apk.get("services"):
+                existing_features["android_services"] = apk["services"]
+            if apk.get("receivers"):
+                existing_features["receivers"] = apk["receivers"]
+            analysis.features = json.dumps(existing_features)
+
+            if apk.get("source_code", {}).get("key_files"):
+                decompiled = json.loads(analysis.decompiled_code or "{}")
+                decompiled["java_classes"] = [
+                    {"name": f.get("path", ""), "code": f.get("content", "")[:5000]}
+                    for f in apk["source_code"]["key_files"][:30]
+                ]
+                decompiled["total_java_files"] = apk["source_code"].get("total_java_files", 0)
+                analysis.decompiled_code = json.dumps(decompiled)
+
+        # --- Merge Ghidra results ---
+        ghidra = results.get("ghidra", {})
+        if ghidra and not ghidra.get("error"):
+            decompiled = json.loads(analysis.decompiled_code or "{}")
+            if ghidra.get("decompiled"):
+                decompiled["ghidra_functions"] = [
+                    {"name": f.get("name", ""), "address": f.get("address", ""), "size": f.get("size", 0), "code": f.get("code", "")[:3000]}
+                    for f in ghidra["decompiled"][:20]
+                ]
+            if ghidra.get("functions"):
+                decompiled["total_functions"] = len(ghidra["functions"])
+            analysis.decompiled_code = json.dumps(decompiled)
+
+        # --- Merge Dynamic analysis ---
+        dynamic = results.get("dynamic", {})
+        if dynamic:
+            network = json.loads(analysis.network_activity or "{}")
+            if dynamic.get("syscalls"):
+                network["syscalls"] = dynamic["syscalls"]
+            if dynamic.get("network_ops"):
+                network["network_operations"] = dynamic["network_ops"]
+            if dynamic.get("file_ops"):
+                network["file_operations"] = dynamic["file_ops"]
+            if dynamic.get("stdout"):
+                network["stdout"] = dynamic["stdout"][:2000]
+            if dynamic.get("stderr"):
+                network["stderr"] = dynamic["stderr"][:2000]
+            analysis.network_activity = json.dumps(network)
+
+        # Store raw worker results
         analysis.worker_results = json.dumps(worker_result)
         analysis.status = "completed"
         analysis.completed_at = datetime.utcnow()
 
         # Generate report
         try:
-            from .report_engine import generate_report
+            from app.engines.report_engine import generate_report
             generate_report(analysis, session)
         except Exception as e:
             analysis.error_message = f"Report generation warning: {str(e)}"
@@ -585,7 +708,7 @@ def merge_worker_results(analysis_id: str, worker_result: dict, db) -> None:
 
 def mark_completed(analysis_id: str, db) -> None:
     """Mark analysis as completed with local results only (worker timeout)."""
-    from ..database import SessionLocal
+    from app.database import SessionLocal
 
     session = SessionLocal()
     try:
@@ -598,7 +721,7 @@ def mark_completed(analysis_id: str, db) -> None:
 
         # Generate report from local results
         try:
-            from .report_engine import generate_report
+            from app.engines.report_engine import generate_report
             generate_report(analysis, session)
         except Exception:
             pass

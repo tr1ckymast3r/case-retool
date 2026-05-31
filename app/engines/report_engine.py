@@ -7,8 +7,8 @@ import json
 import os
 from datetime import datetime
 
-from ..config import settings
-from ..models import Analysis
+from app.config import settings
+from app.models import Analysis
 
 
 def _safe_json(text: str) -> dict:
@@ -103,6 +103,14 @@ def generate_report(analysis: Analysis, db=None) -> str:
         report.append(f"- **Runtime:** {tech_stack['runtime']}")
     if "sdk_version" in tech_stack:
         report.append(f"- **SDK Version:** {tech_stack['sdk_version']}")
+    if "package_name" in tech_stack:
+        report.append(f"- **Package:** {tech_stack['package_name']}")
+    if "package_version" in tech_stack:
+        report.append(f"- **Version:** {tech_stack['package_version']}")
+    if "package_arch" in tech_stack:
+        report.append(f"- **Architecture:** {tech_stack['package_arch']}")
+    if "package_maintainer" in tech_stack:
+        report.append(f"- **Maintainer:** {tech_stack['package_maintainer']}")
     report.append("")
 
     # ================================================================
@@ -243,6 +251,70 @@ def generate_report(analysis: Analysis, db=None) -> str:
             report.append(f"  - `{perm}`")
         report.append("")
 
+    # Crypto detected
+    if "crypto_detected" in features and features["crypto_detected"]:
+        report.append("**Thuật toán mã hóa phát hiện:**")
+        for algo in features["crypto_detected"]:
+            report.append(f"  - `{algo}`")
+        report.append("")
+
+    # Network libraries
+    if "network_libs" in features and features["network_libs"]:
+        report.append("**Thư viện mạng:**")
+        for lib in features["network_libs"]:
+            report.append(f"  - `{lib}`")
+        report.append("")
+
+    # Persistence mechanisms
+    if "persistence_mechanisms" in features and features["persistence_mechanisms"]:
+        report.append("**Cơ chế persistence:**")
+        for mech in features["persistence_mechanisms"]:
+            report.append(f"  - `{mech}`")
+        report.append("")
+
+    # Install scripts (DEB)
+    if "install_scripts" in features and features["install_scripts"]:
+        report.append("**Script cài đặt (DEB package):**")
+        for script_name, script_content in features["install_scripts"].items():
+            report.append(f"### `{script_name}`")
+            if len(script_content) > 2000:
+                script_content = script_content[:2000] + "\n# ... (đã cắt bớt)"
+            report.append(f"```bash\n{script_content}\n```")
+            report.append("")
+
+    # Package files (DEB)
+    if "package_files" in features and features["package_files"]:
+        report.append(f"**Files trong package ({len(features['package_files'])}):**")
+        for f in features["package_files"][:50]:
+            ftype = f.get("type", "")
+            path = f.get("path", "")
+            size = f.get("size", 0)
+            type_str = f" [{ftype}]" if ftype else ""
+            report.append(f"  - `{path}` ({_format_size(size)}){type_str}")
+        if len(features["package_files"]) > 50:
+            report.append(f"  - ... và {len(features['package_files']) - 50} files khác")
+        report.append("")
+
+    # Config files (DEB)
+    if "config_files" in features and features["config_files"]:
+        report.append("**Config files:**")
+        for cf in features["config_files"][:10]:
+            report.append(f"### `{cf.get('path', '')}`")
+            preview = cf.get("content_preview", "")
+            if preview:
+                report.append(f"```\n{preview}\n```")
+            report.append("")
+
+    # Service files (DEB)
+    if "service_files" in features and features["service_files"]:
+        report.append("**Systemd service files:**")
+        for sf in features["service_files"][:10]:
+            report.append(f"### `{sf.get('path', '')}`")
+            content = sf.get("content", "")
+            if content:
+                report.append(f"```ini\n{content}\n```")
+            report.append("")
+
     # ================================================================
     # 5. API ENDPOINTS
     # ================================================================
@@ -300,39 +372,138 @@ def generate_report(analysis: Analysis, db=None) -> str:
     # ================================================================
     # 7. MÃ NGUỒN (Decompiled)
     # ================================================================
-    report.append(_section_header("7. Mã Nguồn (Decompiled)"))
+    report.append(_section_header("7. Mã Nguồn & Phân Tích Sâu"))
 
     if decompiled_code:
-        classes = decompiled_code.get("classes", [])
-        if classes:
-            report.append(f"**Giải mã {len(classes)} classes:**")
+        # ELF Header
+        if "elf_header" in decompiled_code:
+            report.append("**ELF Header:**")
+            report.append(f"```\n{decompiled_code['elf_header'][:2000]}\n```")
             report.append("")
-            for cls in classes[:15]:
-                if isinstance(cls, dict):
-                    name = cls.get("name", "")
-                    report.append(f"### `{name}`")
-                    code = cls.get("code", "")
-                    if code:
-                        # Truncate long code
-                        if len(code) > 2000:
-                            code = code[:2000] + "\n// ... (đã cắt bớt)"
-                        report.append(f"```java\n{code}\n```")
-                    report.append("")
-                else:
-                    report.append(f"- `{cls}`")
-        else:
-            report.append("*Không có mã nguồn giải mã (cần worker container).*")
+
+        # Sections
+        if "sections" in decompiled_code:
+            report.append("**Sections:**")
+            report.append(f"```\n{decompiled_code['sections'][:3000]}\n```")
             report.append("")
+
+        # Dynamic symbols
+        if "dynamic_symbols" in decompiled_code:
+            report.append("**Dynamic Symbols (imports):**")
+            symbols = decompiled_code["dynamic_symbols"]
+            report.append(f"```\n{symbols[:3000]}\n```")
+            report.append("")
+
+        # Disassembly
+        if "disassembly" in decompiled_code:
+            report.append("**Disassembly (sample):**")
+            report.append(f"```asm\n{decompiled_code['disassembly'][:5000]}\n```")
+            report.append("")
+
+        # Ghidra decompiled functions
+        if "ghidra_functions" in decompiled_code:
+            report.append(f"**Ghidra Decompiled Functions ({len(decompiled_code['ghidra_functions'])}):**")
+            report.append("")
+            for func in decompiled_code["ghidra_functions"][:10]:
+                name = func.get("name", "")
+                addr = func.get("address", "")
+                size = func.get("size", 0)
+                code = func.get("code", "")
+                report.append(f"### `{name}` @ {addr} ({size} bytes)")
+                if code:
+                    if len(code) > 2000:
+                        code = code[:2000] + "\n// ... (đã cắt bớt)"
+                    report.append(f"```c\n{code}\n```")
+                report.append("")
+
+        if "total_functions" in decompiled_code:
+            report.append(f"*Tổng cộng {decompiled_code['total_functions']} functions được phân tích.*")
+            report.append("")
+
+        # Package binaries
+        if "package_binaries" in decompiled_code:
+            report.append(f"**Binaries trong package ({len(decompiled_code['package_binaries'])}):**")
+            report.append("")
+            for b in decompiled_code["package_binaries"][:10]:
+                report.append(f"- `{b.get('path', '')}` — {b.get('file_info', '')[:100]}")
+            report.append("")
+
+        # Java classes (APK)
+        if "java_classes" in decompiled_code:
+            total = decompiled_code.get("total_java_files", 0)
+            report.append(f"**Java Classes ({len(decompiled_code['java_classes'])} shown / {total} total):**")
+            report.append("")
+            for cls in decompiled_code["java_classes"][:10]:
+                name = cls.get("name", "")
+                code = cls.get("code", "")
+                report.append(f"### `{name}`")
+                if code:
+                    if len(code) > 2000:
+                        code = code[:2000] + "\n// ... (đã cắt bớt)"
+                    report.append(f"```java\n{code}\n```")
+                report.append("")
+
+        # Fallback for old format
+        if "classes" in decompiled_code:
+            classes = decompiled_code["classes"]
+            if classes:
+                report.append(f"**Giải mã {len(classes)} classes:**")
+                report.append("")
+                for cls in classes[:15]:
+                    if isinstance(cls, dict):
+                        name = cls.get("name", "")
+                        report.append(f"### `{name}`")
+                        code = cls.get("code", "")
+                        if code:
+                            if len(code) > 2000:
+                                code = code[:2000] + "\n// ... (đã cắt bớt)"
+                            report.append(f"```java\n{code}\n```")
+                        report.append("")
+                    else:
+                        report.append(f"- `{cls}`")
     else:
-        report.append("*Không có mã nguồn giải mã (cần worker container để phân tích sâu).*")
+        report.append("*Không có mã nguồn giải mã.*")
         report.append("")
 
     # ================================================================
-    # 8. NETWORK ACTIVITY
+    # 8. NETWORK ACTIVITY & DYNAMIC ANALYSIS
     # ================================================================
-    report.append(_section_header("8. Network Activity"))
+    report.append(_section_header("8. Network Activity & Dynamic Analysis"))
 
     if network_activity:
+        # Syscalls from dynamic analysis
+        if "syscalls" in network_activity:
+            report.append("**System Calls (Top 30):**")
+            for syscall, count in list(network_activity["syscalls"].items())[:30]:
+                report.append(f"  - `{syscall}`: {count}")
+            report.append("")
+
+        # Network operations
+        if "network_operations" in network_activity:
+            report.append("**Network Operations:**")
+            for op in network_activity["network_operations"][:20]:
+                report.append(f"  - `{op}`")
+            report.append("")
+
+        # File operations
+        if "file_operations" in network_activity:
+            report.append("**File Operations:**")
+            for op in network_activity["file_operations"][:20]:
+                report.append(f"  - `{op}`")
+            report.append("")
+
+        # stdout/stderr
+        if "stdout" in network_activity and network_activity["stdout"]:
+            report.append("**Program stdout:**")
+            report.append(f"```\n{network_activity['stdout'][:2000]}\n```")
+            report.append("")
+
+        if "stderr" in network_activity and network_activity["stderr"]:
+            report.append("**Program stderr:**")
+            report.append(f"```\n{network_activity['stderr'][:2000]}\n```")
+            report.append("")
+
+        # Legacy format
         connections = network_activity.get("connections", [])
         domains = network_activity.get("domains", [])
         dns_queries = network_activity.get("dns_queries", [])
@@ -352,17 +523,12 @@ def generate_report(analysis: Analysis, db=None) -> str:
                 report.append(f"  - `{d}`")
             report.append("")
 
-        if dns_queries:
-            report.append("**DNS Queries:**")
-            for q in dns_queries[:20]:
-                report.append(f"  - `{q}`")
-            report.append("")
-
-        if not connections and not domains and not dns_queries:
-            report.append("*Không phát hiện hoạt động mạng (cần phân tích động với worker).*")
+        if not any([connections, domains, dns_queries, "syscalls" in network_activity,
+                    "network_operations" in network_activity, "file_operations" in network_activity]):
+            report.append("*Không phát hiện hoạt động mạng.*")
             report.append("")
     else:
-        report.append("*Không phát hiện hoạt động mạng (cần worker container để phân tích động).*")
+        report.append("*Không phát hiện hoạt động mạng.*")
         report.append("")
 
     # ================================================================

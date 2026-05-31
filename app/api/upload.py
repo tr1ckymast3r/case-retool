@@ -14,10 +14,10 @@ from datetime import datetime
 from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from ..config import settings
-from ..database import get_db
-from ..models import Analysis
-from ..engines.static_engine import run_local_analysis, merge_worker_results, mark_completed
+from app.config import settings
+from app.database import get_db
+from app.models import Analysis
+from app.engines.static_engine import run_local_analysis, merge_worker_results, mark_completed
 
 router = APIRouter(prefix="/api", tags=["upload"])
 
@@ -49,10 +49,25 @@ def _start_worker_poll(analysis_id: str, filepath: str, profile: str, file_type:
     os.makedirs(settings.WORKER_INPUT, exist_ok=True)
     os.makedirs(settings.WORKER_OUTPUT, exist_ok=True)
 
+    print(f"[ReTool] Dispatching to worker: id={analysis_id}, type={file_type}, profile={profile}", flush=True)
+    print(f"[ReTool]   Source: {filepath}", flush=True)
+    print(f"[ReTool]   Worker input: {settings.WORKER_INPUT}", flush=True)
+
+    # Copy file to shared volume so worker can access it
+    shared_input = os.path.join(settings.WORKER_INPUT, f"{analysis_id}_{os.path.basename(filepath)}")
+    try:
+        shutil.copy2(filepath, shared_input)
+        worker_filepath = shared_input
+        print(f"[ReTool]   Copied to: {shared_input} ({os.path.getsize(shared_input)} bytes)", flush=True)
+    except Exception as e:
+        print(f"[WARN] Could not copy to shared volume: {e}", flush=True)
+        mark_completed(analysis_id, None)
+        return
+
     # Write task JSON for worker
     task = {
         "id": analysis_id,
-        "filepath": filepath,
+        "filepath": worker_filepath,
         "profile": profile,
         "file_type": file_type,
         "timestamp": datetime.utcnow().isoformat(),
@@ -61,15 +76,22 @@ def _start_worker_poll(analysis_id: str, filepath: str, profile: str, file_type:
     try:
         with open(task_path, "w") as f:
             json.dump(task, f)
+        print(f"[ReTool]   Task written: {task_path}", flush=True)
+        # Verify it was written
+        if os.path.exists(task_path):
+            print(f"[ReTool]   Task verified: {os.path.getsize(task_path)} bytes", flush=True)
+        else:
+            print(f"[ERROR]   Task file NOT found after write!", flush=True)
     except Exception as e:
         # If we can't write to worker input, just mark completed with local results
-        print(f"[WARN] Could not write worker task: {e}")
+        print(f"[WARN] Could not write worker task: {e}", flush=True)
         mark_completed(analysis_id, None)
         return
 
     # Background thread polls for worker result
     def poll_worker():
         result_path = os.path.join(settings.WORKER_OUTPUT, f"{analysis_id}.json")
+        print(f"[ReTool]   Polling for: {result_path}", flush=True)
         for i in range(300):  # 10 minutes max (2s * 300)
             time.sleep(2)
             if os.path.exists(result_path):
@@ -78,6 +100,7 @@ def _start_worker_poll(analysis_id: str, filepath: str, profile: str, file_type:
                     time.sleep(0.5)
                     with open(result_path) as f:
                         worker_result = json.load(f)
+                    print(f"[ReTool]   Worker result received for {analysis_id}", flush=True)
                     merge_worker_results(analysis_id, worker_result, None)
                     # Clean up task and result files
                     try:
@@ -89,12 +112,14 @@ def _start_worker_poll(analysis_id: str, filepath: str, profile: str, file_type:
                     except Exception:
                         pass
                 except Exception as e:
-                    print(f"[ERROR] Failed to process worker result: {e}")
+                    print(f"[ERROR] Failed to process worker result: {e}", flush=True)
                     mark_completed(analysis_id, None)
                 return
+            if i % 30 == 29:  # Log every 60 seconds
+                print(f"[ReTool]   Still waiting for worker result ({analysis_id})... {(i+1)*2}s", flush=True)
         else:
             # Timeout — mark as completed with local results only
-            print(f"[WARN] Worker timeout for analysis {analysis_id}")
+            print(f"[WARN] Worker timeout for analysis {analysis_id}", flush=True)
             mark_completed(analysis_id, None)
             # Clean up task file
             try:

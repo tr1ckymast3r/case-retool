@@ -556,23 +556,35 @@ def process_task(task_file):
 
 def main():
     """Main worker loop — watch for new tasks."""
-    print("ReTool Worker started. Watching for tasks...")
+    print("ReTool Worker started. Watching for tasks...", flush=True)
+    print(f"  INPUT_DIR: {INPUT_DIR}", flush=True)
+    print(f"  OUTPUT_DIR: {OUTPUT_DIR}", flush=True)
     INPUT_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    heartbeat = 0
     while True:
         try:
             tasks = list(INPUT_DIR.glob("*.json"))
-            for task_file in tasks:
-                print(f"Processing: {task_file.name}")
-                try:
-                    result = process_task(str(task_file))
-                    print(f"Done: {result['id']} — {result['status']}")
-                except Exception as e:
-                    print(f"Error: {e}")
-                    traceback.print_exc()
+            if tasks:
+                for task_file in tasks:
+                    print(f"Processing: {task_file.name}", flush=True)
+                    try:
+                        result = process_task(str(task_file))
+                        print(f"Done: {result['id']} — {result['status']}", flush=True)
+                    except Exception as e:
+                        print(f"Error processing {task_file}: {e}", flush=True)
+                        traceback.print_exc()
+            else:
+                heartbeat += 1
+                if heartbeat >= 15:  # Every 30 seconds
+                    # List what's in input dir for debugging
+                    all_files = list(INPUT_DIR.iterdir())
+                    print(f"[heartbeat] No tasks. Input dir has {len(all_files)} files: {[f.name for f in all_files[:5]]}", flush=True)
+                    heartbeat = 0
         except Exception as e:
-            print(f"Worker error: {e}")
+            print(f"Worker error: {e}", flush=True)
+            traceback.print_exc()
 
         time.sleep(2)
 

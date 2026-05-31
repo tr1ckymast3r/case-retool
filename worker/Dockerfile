@@ -1,6 +1,8 @@
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
 
 # System deps
 RUN apt-get update && apt-get install -y \
@@ -9,7 +11,7 @@ RUN apt-get update && apt-get install -y \
     openjdk-17-jdk-headless \
     python3 python3-pip \
     net-tools iproute2 \
-    p7zip-full ar \
+    p7zip-full binutils \
     libssl-dev libffi-dev \
     && rm -rf /var/lib/apt/lists/*
 

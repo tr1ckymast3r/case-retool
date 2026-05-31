@@ -11,6 +11,7 @@ services:
     environment:
       - DATABASE_URL=sqlite:///app/data/retool.db
       - WORKER_DATA_DIR=/data
+      - PYTHONUNBUFFERED=1
     depends_on:
       - worker
     restart: unless-stopped

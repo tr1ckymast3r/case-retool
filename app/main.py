@@ -11,11 +11,11 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from .config import settings
-from .database import init_db
-from .api.upload import router as upload_router
-from .api.analysis import router as analysis_router
-from .api.stats import router as stats_router
+from app.config import settings
+from app.database import init_db
+from app.api.upload import router as upload_router
+from app.api.analysis import router as analysis_router
+from app.api.stats import router as stats_router
 
 
 @asynccontextmanager
