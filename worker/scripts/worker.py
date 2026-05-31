@@ -16,6 +16,9 @@ INPUT_DIR = DATA_DIR / "input"
 OUTPUT_DIR = DATA_DIR / "output"
 SCRIPTS_DIR = Path("/opt/retool/scripts")
 
+# Add scripts dir to path for imports
+sys.path.insert(0, str(SCRIPTS_DIR))
+
 
 def run_cmd(cmd, timeout=120, cwd=None):
     """Run shell command, return (stdout, stderr, returncode)."""
