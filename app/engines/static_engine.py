@@ -164,6 +164,57 @@ def detect_file_type(filepath: str) -> dict:
         result["details"] = "ZIP archive"
         return result
 
+    # RAR
+    if header[:4] == b"Rar!\x1a\x07" or header[:3] == b"Rar":
+        result["type"] = "RAR"
+        result["details"] = "RAR archive"
+        return result
+
+    # 7z
+    if header[:6] == b"\x37\x7a\xbc\xaf\x27\x1c":
+        result["type"] = "7z"
+        result["details"] = "7-Zip archive"
+        return result
+
+    # TAR (ustar magic at offset 257)
+    if len(header) >= 263 and header[257:263] == b"ustar\x00":
+        result["type"] = "TAR"
+        result["details"] = "TAR archive"
+        return result
+
+    # GZ (single file or tar.gz)
+    if header[:2] == b"\x1f\x8b":
+        fname_lower = os.path.basename(filepath).lower()
+        if fname_lower.endswith(".tar.gz") or fname_lower.endswith(".tgz"):
+            result["type"] = "TGZ"
+            result["details"] = "Gzipped TAR archive"
+        else:
+            result["type"] = "GZ"
+            result["details"] = "Gzip compressed file"
+        return result
+
+    # BZ2
+    if header[:3] == b"BZh":
+        fname_lower = os.path.basename(filepath).lower()
+        if fname_lower.endswith(".tar.bz2"):
+            result["type"] = "TBZ2"
+            result["details"] = "Bzip2 compressed TAR"
+        else:
+            result["type"] = "BZ2"
+            result["details"] = "Bzip2 compressed file"
+        return result
+
+    # XZ
+    if header[:6] == b"\xfd7zXZ\x00":
+        fname_lower = os.path.basename(filepath).lower()
+        if fname_lower.endswith(".tar.xz"):
+            result["type"] = "TXZ"
+            result["details"] = "XZ compressed TAR"
+        else:
+            result["type"] = "XZ"
+            result["details"] = "XZ compressed file"
+        return result
+
     # SO (shared object) — typically ELF but check extension
     ext = os.path.splitext(filepath)[1].lower()
     if ext == ".so":

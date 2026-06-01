@@ -924,9 +924,31 @@ def process_task(task_file):
 
     try:
         # ============================================================
+        # PHASE 0: Archive handling — extract and find real payload
+        # ============================================================
+        if file_type in ("ZIP", "RAR", "7z", "TAR", "TGZ", "TBZ2", "TXZ", "GZ", "BZ2", "XZ"):
+            print(f"  [task] Archive detected ({file_type}) — extracting...", flush=True)
+            archive_result = handle_archive(filepath, str(OUTPUT_DIR / analysis_id))
+            output["extraction"] = archive_result
+
+            # Analyze extracted executables
+            execs = archive_result.get("executables", [])
+            if execs:
+                print(f"  [task] Found {len(execs)} executables in archive", flush=True)
+                for i, exe_path in enumerate(execs[:10]):
+                    try:
+                        child = analyze_extracted_file(exe_path, i)
+                        if child:
+                            output["children"].append(child)
+                    except Exception as e:
+                        print(f"  [task] Error analyzing {exe_path}: {e}", flush=True)
+
+            output["status"] = "completed"
+
+        # ============================================================
         # PHASE 1: Auto-detect + Extract (always, for all PE files)
         # ============================================================
-        if file_type in ("PE", "DLL"):
+        elif file_type in ("PE", "DLL"):
             from extractor import auto_extract
             extract_result = auto_extract(filepath, str(OUTPUT_DIR / analysis_id))
             output["extraction"] = {
@@ -966,6 +988,12 @@ def process_task(task_file):
             # If extraction found interesting content, update the detection
             if extract_result["detection"].get("sub_type") in ("dotnet",):
                 file_type = ".NET"
+
+            # Installer simulation — try to install with Wine
+            if extract_result["detection"].get("sub_type") in ("nsis", "inno", "installshield", "msi"):
+                print(f"  [task] Installer detected — simulating installation...", flush=True)
+                install_result = simulate_installer(filepath, str(OUTPUT_DIR / analysis_id))
+                output["extraction"]["installer_simulation"] = install_result
 
         # ============================================================
         # PHASE 3: Main file analysis
@@ -1023,6 +1051,174 @@ def process_task(task_file):
     os.remove(task_file)
 
     return output
+
+
+def handle_archive(filepath, output_dir):
+    """Extract archive and find executables inside.
+    Handles: ZIP, RAR, 7z, TAR, TAR.GZ, TAR.BZ2, TAR.XZ, GZ, BZ2, XZ
+    """
+    result = {"method": "archive", "total_extracted": 0, "executables": [],
+              "all_files": [], "error": None}
+
+    extract_dir = os.path.join(output_dir, "extracted")
+    os.makedirs(extract_dir, exist_ok=True)
+
+    fname = os.path.basename(filepath).lower()
+
+    # Determine archive type and extract
+    extracted = []
+
+    if fname.endswith((".zip", ".apk", ".jar", ".ipa", ".war", ".ear")) or filepath.lower().endswith(".zip"):
+        # ZIP-based
+        try:
+            import zipfile
+            with zipfile.ZipFile(filepath, 'r') as zf:
+                zf.extractall(extract_dir)
+                extracted = [os.path.join(extract_dir, n) for n in zf.namelist() if not n.endswith('/')]
+            print(f"  [archive] ZIP extracted {len(extracted)} files", flush=True)
+        except Exception as e:
+            result["error"] = f"ZIP extraction failed: {e}"
+
+    elif fname.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tar.xz", ".tar")):
+        # TAR-based
+        out, err, rc = run_cmd(f"tar xf '{filepath}' -C '{extract_dir}'", timeout=120)
+        if rc == 0:
+            for root, dirs, files in os.walk(extract_dir):
+                for f in files:
+                    extracted.append(os.path.join(root, f))
+            print(f"  [archive] TAR extracted {len(extracted)} files", flush=True)
+        else:
+            result["error"] = f"TAR extraction failed: {err[:200]}"
+
+    elif fname.endswith(".gz") and not fname.endswith(".tar.gz"):
+        # Single GZ file
+        out_name = filepath.rstrip(".gz").rstrip(".GZ")
+        out, err, rc = run_cmd(f"gunzip -c '{filepath}' > '{extract_dir}/{os.path.basename(out_name)}'", timeout=60)
+        if rc == 0:
+            extracted = [f"{extract_dir}/{os.path.basename(out_name)}"]
+
+    elif fname.endswith(".bz2"):
+        out_name = filepath.rstrip(".bz2").rstrip(".BZ2")
+        out, err, rc = run_cmd(f"bunzip2 -c '{filepath}' > '{extract_dir}/{os.path.basename(out_name)}'", timeout=60)
+        if rc == 0:
+            extracted = [f"{extract_dir}/{os.path.basename(out_name)}"]
+
+    elif fname.endswith(".xz"):
+        out_name = filepath.rstrip(".xz").rstrip(".XZ")
+        out, err, rc = run_cmd(f"xz -dc '{filepath}' > '{extract_dir}/{os.path.basename(out_name)}'", timeout=60)
+        if rc == 0:
+            extracted = [f"{extract_dir}/{os.path.basename(out_name)}"]
+
+    elif fname.endswith(".rar"):
+        # RAR
+        out, err, rc = run_cmd(f"7z x -y -o'{extract_dir}' '{filepath}'", timeout=120)
+        if rc == 0:
+            for root, dirs, files in os.walk(extract_dir):
+                for f in files:
+                    extracted.append(os.path.join(root, f))
+            print(f"  [archive] RAR extracted {len(extracted)} files", flush=True)
+        else:
+            result["error"] = f"RAR extraction failed: {err[:200]}"
+
+    elif fname.endswith(".7z"):
+        # 7z
+        out, err, rc = run_cmd(f"7z x -y -o'{extract_dir}' '{filepath}'", timeout=120)
+        if rc == 0:
+            for root, dirs, files in os.walk(extract_dir):
+                for f in files:
+                    extracted.append(os.path.join(root, f))
+            print(f"  [archive] 7z extracted {len(extracted)} files", flush=True)
+        else:
+            result["error"] = f"7z extraction failed: {err[:200]}"
+
+    else:
+        # Generic: try 7z
+        out, err, rc = run_cmd(f"7z x -y -o'{extract_dir}' '{filepath}'", timeout=120)
+        if rc == 0:
+            for root, dirs, files in os.walk(extract_dir):
+                for f in files:
+                    extracted.append(os.path.join(root, f))
+
+    # Filter out directories, keep only files
+    extracted = [f for f in extracted if os.path.isfile(f)]
+    result["total_extracted"] = len(extracted)
+    result["all_files"] = [{"name": os.path.basename(f), "size": os.path.getsize(f)} for f in extracted[:100]]
+
+    # Find executables
+    exe_extensions = {'.exe', '.dll', '.sys', '.msi', '.bat', '.cmd', '.ps1', '.vbs', '.js',
+                      '.apk', '.jar', '.elf', '.so', '.dylib', '.sh', '.py', '.rb'}
+    for fpath in extracted:
+        ext = os.path.splitext(fpath)[1].lower()
+        if ext in exe_extensions:
+            result["executables"].append(fpath)
+        else:
+            # Check magic bytes
+            try:
+                with open(fpath, "rb") as f:
+                    magic = f.read(4)
+                if magic[:2] == b"MZ" or magic[:4] == b"\x7fELF":
+                    result["executables"].append(fpath)
+            except:
+                pass
+
+    # Sort executables by size (bigger = more likely to be the main payload)
+    result["executables"].sort(key=lambda x: os.path.getsize(x) if os.path.exists(x) else 0, reverse=True)
+
+    print(f"  [archive] Found {len(result['executables'])} executables", flush=True)
+    return result
+
+
+def simulate_installer(filepath, output_dir):
+    """Run installer with Wine in silent mode, capture installed files."""
+    result = {"simulated": False, "installed_files": [], "error": None}
+
+    wine_prefix = os.path.join(output_dir, "wineprefix")
+    install_dir = os.path.join(output_dir, "installed")
+    os.makedirs(install_dir, exist_ok=True)
+
+    env = f"WINEPREFIX={wine_prefix} WINEDEBUG=-all DISPLAY=:99"
+
+    # Try common silent install switches
+    silent_switches = [
+        "/SILENT", "/VERYSILENT", "/S", "/quiet", "/qn",
+        "/norestart", "/accepteula", "/install",
+        "--silent", "--quiet", "-q", "-s"
+    ]
+
+    # Snapshot wine prefix before
+    before_files = set()
+    if os.path.exists(wine_prefix):
+        for root, dirs, files in os.walk(wine_prefix):
+            for f in files:
+                before_files.add(os.path.join(root, f))
+
+    # Run installer with Wine
+    print(f"  [installer] Running with Wine (silent mode)...", flush=True)
+    for switch in silent_switches[:3]:  # Try first 3 switches
+        out, err, rc = run_cmd(
+            f"{env} timeout 60 wine '{filepath}' {switch}",
+            timeout=70
+        )
+        if rc == 0:
+            print(f"  [installer] Ran with switch {switch}", flush=True)
+            break
+
+    # Also try without switches
+    out, err, rc = run_cmd(f"{env} timeout 30 wine '{filepath}'", timeout=35)
+
+    # Collect new files
+    after_files = set()
+    if os.path.exists(wine_prefix):
+        for root, dirs, files in os.walk(wine_prefix):
+            for f in files:
+                after_files.add(os.path.join(root, f))
+
+    new_files = after_files - before_files
+    result["installed_files"] = list(new_files)
+    result["simulated"] = len(new_files) > 0
+
+    print(f"  [installer] {len(new_files)} new files created", flush=True)
+    return result
 
 
 def analyze_extracted_file(filepath, index):
