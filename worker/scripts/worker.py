@@ -1069,15 +1069,39 @@ def handle_archive(filepath, output_dir):
     extracted = []
 
     if fname.endswith((".zip", ".apk", ".jar", ".ipa", ".war", ".ear")) or filepath.lower().endswith(".zip"):
-        # ZIP-based
-        try:
-            import zipfile
-            with zipfile.ZipFile(filepath, 'r') as zf:
-                zf.extractall(extract_dir)
-                extracted = [os.path.join(extract_dir, n) for n in zf.namelist() if not n.endswith('/')]
-            print(f"  [archive] ZIP extracted {len(extracted)} files", flush=True)
-        except Exception as e:
-            result["error"] = f"ZIP extraction failed: {e}"
+        # ZIP-based: try 7z first (handles encoding issues better), fallback to Python zipfile
+        extracted_7z = False
+        out, err, rc = run_cmd(f"7z x -y -o'{extract_dir}' '{filepath}'", timeout=300)
+        if rc == 0:
+            for root, dirs, files in os.walk(extract_dir):
+                for f in files:
+                    extracted.append(os.path.join(root, f))
+            extracted_7z = True
+            print(f"  [archive] ZIP (7z) extracted {len(extracted)} files", flush=True)
+        else:
+            # Fallback: Python zipfile with per-file error handling
+            try:
+                import zipfile
+                with zipfile.ZipFile(filepath, 'r') as zf:
+                    for info in zf.infolist():
+                        try:
+                            zf.extract(info, extract_dir)
+                        except Exception:
+                            # Try extracting with corrected filename
+                            try:
+                                data = zf.read(info.filename)
+                                out_path = os.path.join(extract_dir, info.filename)
+                                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                                with open(out_path, 'wb') as fout:
+                                    fout.write(data)
+                            except Exception:
+                                pass
+                for root, dirs, files in os.walk(extract_dir):
+                    for f in files:
+                        extracted.append(os.path.join(root, f))
+                print(f"  [archive] ZIP (python) extracted {len(extracted)} files", flush=True)
+            except Exception as e:
+                result["error"] = f"ZIP extraction failed: {e}"
 
     elif fname.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tar.xz", ".tar")):
         # TAR-based
@@ -1163,6 +1187,58 @@ def handle_archive(filepath, output_dir):
 
     # Sort executables by size (bigger = more likely to be the main payload)
     result["executables"].sort(key=lambda x: os.path.getsize(x) if os.path.exists(x) else 0, reverse=True)
+
+    # Detect Node.js/Electron projects — find and prioritize main JS files
+    js_projects = []
+    for fpath in extracted:
+        if fpath.endswith('package.json'):
+            try:
+                import json as _json
+                with open(fpath) as pf:
+                    pkg = _json.load(pf)
+                project_dir = os.path.dirname(fpath)
+                main_file = pkg.get('main', '')
+                is_electron = 'electron' in str(pkg.get('dependencies', {})) or 'electron' in str(pkg.get('devDependencies', {}))
+                if main_file:
+                    main_path = os.path.join(project_dir, main_file)
+                    if os.path.exists(main_path):
+                        js_projects.append({
+                            "project_dir": project_dir,
+                            "package_name": pkg.get("name", "unknown"),
+                            "package_version": pkg.get("version", "unknown"),
+                            "main_file": main_path,
+                            "main_size": os.path.getsize(main_path),
+                            "is_electron": is_electron,
+                            "dependencies": list(pkg.get("dependencies", {}).keys()),
+                            "description": pkg.get("description", ""),
+                        })
+            except Exception:
+                pass
+
+    if js_projects:
+        result["js_projects"] = js_projects
+        # Add main JS files as "executables" for analysis
+        for proj in js_projects:
+            main_path = proj["main_file"]
+            if main_path not in result["executables"]:
+                result["executables"].insert(0, main_path)
+        print(f"  [archive] Found {len(js_projects)} Node.js/Electron project(s)", flush=True)
+
+    # Find license/crack related files
+    license_files = []
+    for fpath in extracted:
+        fname_lower = os.path.basename(fpath).lower()
+        if any(kw in fname_lower for kw in ['license', 'crack', 'patch', 'keygen', 'activ', 'serial', 'reg']):
+            try:
+                license_files.append({
+                    "path": fpath,
+                    "size": os.path.getsize(fpath),
+                    "content_preview": open(fpath, 'r', errors='replace').read(2000)
+                })
+            except:
+                license_files.append({"path": fpath, "size": os.path.getsize(fpath)})
+    if license_files:
+        result["license_files"] = license_files[:10]
 
     print(f"  [archive] Found {len(result['executables'])} executables", flush=True)
     return result
