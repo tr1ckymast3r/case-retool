@@ -1,0 +1,1278 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🔍 ReTool — Phân Tích Phần Mềm Đối Thủ</title>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background: #0f172a; }
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #1e293b; }
+        ::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
+        .drop-zone-active { border-color: #6366f1 !important; background: rgba(99,102,241,0.1) !important; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .spinner { animation: spin 1s linear infinite; }
+        @keyframes fadeIn { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }
+        .fade-in { animation: fadeIn 0.3s ease-out; }
+        .scrollbar-hide::-webkit-scrollbar { display: none; }
+        .scrollbar-hide { -ms-overflow-style: none; scrollbar-width: none; }
+        @media (max-width: 1023px) {
+          .touch-table td, .touch-table th { padding: 0.5rem 0.25rem; font-size: 0.75rem; }
+        }
+    </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useCallback, useRef } = React;
+
+// ── API helper ──
+const api = {
+  get: (url) => fetch(url).then(r => r.json()),
+  post: (url, body) => fetch(url, { method:'POST', body }).then(r => r.json()),
+  delete: (url) => fetch(url, { method:'DELETE' }).then(r => r.json()),
+};
+
+// ── Simple markdown renderer ──
+function renderMarkdown(md) {
+  if (!md) return '';
+  let html = md
+    .replace(/^### (.+)$/gm, '<h3 class="text-lg font-bold text-indigo-400 mt-4 mb-2">$1</h3>')
+    .replace(/^## (.+)$/gm, '<h2 class="text-xl font-bold text-indigo-300 mt-6 mb-3">$1</h2>')
+    .replace(/^# (.+)$/gm, '<h1 class="text-2xl font-bold text-indigo-200 mt-6 mb-3">$1</h1>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong class="text-white">$1</strong>')
+    .replace(/\*(.+?)\*/g, '<em class="text-slate-300">$1</em>')
+    .replace(/^- (.+)$/gm, '<li class="ml-4 text-slate-300">$1</li>')
+    .replace(/^(\d+)\. (.+)$/gm, '<li class="ml-4 text-slate-300">$2</li>')
+    .replace(/`(.+?)`/g, '<code class="bg-slate-700 px-1 rounded text-indigo-300">$1</code>')
+    .replace(/\n\n/g, '<br/><br/>');
+  html = html.replace(/(<li.*<\/li>)/s, '<ul class="list-disc mb-2">$1</ul>');
+  return html;
+}
+
+// ── Toast System ──
+let toastId = 0;
+function ToastContainer({ toasts, remove }) {
+  return (
+    <div className="fixed top-4 right-4 z-50 flex flex-col gap-2">
+      {toasts.map(t => (
+        <div key={t.id} className={`fade-in px-4 py-3 rounded-lg shadow-lg text-sm font-medium flex items-center gap-2 ${
+          t.type==='success' ? 'bg-green-600 text-white' : t.type==='error' ? 'bg-red-600 text-white' : 'bg-indigo-600 text-white'
+        }`} onClick={() => remove(t.id)}>
+          {t.type==='success' ? '✅' : t.type==='error' ? '❌' : 'ℹ️'} {t.msg}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── Loading Spinner ──
+function Spinner({ size = 'md' }) {
+  const s = size==='sm' ? 'h-5 w-5' : size==='lg' ? 'h-12 w-12' : 'h-8 w-8';
+  return (
+    <div className="flex justify-center items-center py-8">
+      <div className={`spinner rounded-full border-2 border-slate-600 border-t-indigo-500 ${s}`}></div>
+    </div>
+  );
+}
+
+// ── Badge helpers ──
+const statusBadge = (s) => {
+  const map = { queued:'bg-gray-500', analyzing:'bg-yellow-500', completed:'bg-green-500', failed:'bg-red-500' };
+  const label = { queued:'Chờ xử lý', analyzing:'Đang phân tích', completed:'Hoàn thành', failed:'Lỗi' };
+  const icon = { queued:'⏳', analyzing:'🔄', completed:'✅', failed:'❌' };
+  return <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium text-white ${map[s]||'bg-gray-500'}`}>
+    {s === 'analyzing' && <span className="inline-block w-3 h-3 border-2 border-white/30 border-t-white rounded-full animate-spin"></span>}
+    {icon[s]||''} {label[s]||s}
+  </span>;
+};
+
+const fileBadge = (ft) => {
+  const map = { PE:'bg-blue-600', ELF:'bg-orange-600', APK:'bg-green-600', DEB:'bg-orange-500', DMG:'bg-slate-500', IPA:'bg-purple-600', MSI:'bg-blue-500', EXE:'bg-blue-600', DLL:'bg-cyan-600', SO:'bg-orange-600' };
+  return <span className={`px-2 py-0.5 rounded text-xs font-mono font-bold text-white ${map[ft]||'bg-slate-600'}`}>{ft||'—'}</span>;
+};
+
+const platformIcon = (p) => {
+  const map = { linux:'🐧', windows:'🪟', android:'🤖', ios:'🍎', macos:'🍏' };
+  return map[(p||'').toLowerCase()] || '💻';
+};
+
+// ── Sidebar ──
+function Sidebar({ page, nav, isOpen, setIsOpen }) {
+  const items = [
+    { id:'dashboard', icon:'📊', label:'Bảng điều khiển' },
+    { id:'upload', icon:'📤', label:'Phân tích mới' },
+  ];
+  return (
+    <>
+      {/* Mobile overlay */}
+      {isOpen && <div className="fixed inset-0 bg-black/50 z-40 lg:hidden" onClick={() => setIsOpen(false)} />}
+      <aside className={`fixed lg:static inset-y-0 left-0 z-50 w-64 bg-slate-800 border-r border-slate-700 flex flex-col transform transition-transform duration-200 ${isOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0'}`}>
+        <div className="p-4 border-b border-slate-700 flex items-center justify-between">
+          <div>
+            <h1 className="text-lg font-bold text-white">🔍 ReTool</h1>
+            <p className="text-xs text-slate-400">Phân Tích Phần Mềm Đối Thủ</p>
+          </div>
+          <button onClick={() => setIsOpen(false)} className="lg:hidden text-slate-400 hover:text-white p-1">✕</button>
+        </div>
+        <nav className="flex-1 p-2">
+          {items.map(i => (
+            <button key={i.id} onClick={() => { nav(i.id); setIsOpen(false); }} className={`w-full text-left px-4 py-3 rounded-lg mb-1 flex items-center gap-3 transition-colors ${page===i.id ? 'bg-indigo-600 text-white' : 'text-slate-300 hover:bg-slate-700'}`}>
+              <span>{i.icon}</span><span>{i.label}</span>
+            </button>
+          ))}
+        </nav>
+        <div className="p-4 border-t border-slate-700 text-xs text-slate-500">ReTool v1.0 — © 2026</div>
+      </aside>
+    </>
+  );
+}
+
+// ── Dashboard Page ──
+function Dashboard({ nav, addToast }) {
+  const [stats, setStats] = useState(null);
+  const [analyses, setAnalyses] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState('');
+  const [filterStatus, setFilterStatus] = useState('');
+  const [filterType, setFilterType] = useState('');
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [s, a] = await Promise.all([
+        api.get('/api/stats'),
+        api.get(`/api/analyses?status=${filterStatus}&type=${filterType}&search=${search}`)
+      ]);
+      setStats(s);
+      setAnalyses(Array.isArray(a) ? a : (a.analyses || []));
+    } catch(e) { addToast('Lỗi tải dữ liệu', 'error'); }
+    setLoading(false);
+  }, [filterStatus, filterType, search]);
+
+  useEffect(() => { load(); }, [load]);
+
+  // Auto-refresh when there are analyzing items
+  const hasAnalyzing = analyses.some(a => a.status === 'analyzing' || a.status === 'queued');
+  useEffect(() => {
+    if (!hasAnalyzing) return;
+    const interval = setInterval(load, 5000);
+    return () => clearInterval(interval);
+  }, [hasAnalyzing, load]);
+
+  if (loading && analyses.length === 0) return <Spinner />;
+
+  const statCards = [
+    { label:'Tổng phân tích', value: stats?.total||0, icon:'📦', color:'bg-indigo-600' },
+    { label:'Hoàn thành', value: stats?.completed||0, icon:'✅', color:'bg-green-600' },
+    { label:'Đang chạy', value: stats?.running||0, icon:'⏳', color:'bg-yellow-600' },
+    { label:'Lỗi', value: stats?.failed||0, icon:'❌', color:'bg-red-600' },
+  ];
+
+  const platforms = stats?.platforms || {};
+  const fileTypes = stats?.file_types || {};
+
+  return (
+    <div className="fade-in space-y-6">
+      <h2 className="text-2xl font-bold text-white">📊 Bảng Điều Khiển</h2>
+      
+      {/* Stat Cards */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        {statCards.map(c => (
+          <div key={c.label} className={`${c.color} rounded-xl p-3 md:p-5 shadow-lg`}>
+            <div className="text-2xl md:text-3xl mb-1">{c.icon}</div>
+            <div className="text-xl md:text-2xl font-bold text-white">{c.value}</div>
+            <div className="text-xs md:text-sm text-white/80">{c.label}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Platform & File Type Distribution */}
+      <div className="grid md:grid-cols-2 gap-4">
+        <div className="bg-slate-800 rounded-xl p-5 border border-slate-700">
+          <h3 className="text-lg font-semibold text-white mb-3">🖥️ Phân Bố Nền Tảng</h3>
+          {Object.entries(platforms).length > 0 ? Object.entries(platforms).map(([k,v]) => (
+            <div key={k} className="flex items-center justify-between py-1.5">
+              <span className="text-slate-300">{platformIcon(k)} {k}</span>
+              <div className="flex items-center gap-2">
+                <div className="w-32 bg-slate-700 rounded-full h-2">
+                  <div className="bg-indigo-500 h-2 rounded-full" style={{width:`${Math.min(100, (v/Math.max(1,...Object.values(platforms).reduce((a,b)=>a+b,0)))*100)}%`}}></div>
+                </div>
+                <span className="text-slate-400 text-sm w-8 text-right">{v}</span>
+              </div>
+            </div>
+          )) : <p className="text-slate-500">Chưa có dữ liệu</p>}
+        </div>
+
+        <div className="bg-slate-800 rounded-xl p-5 border border-slate-700">
+          <h3 className="text-lg font-semibold text-white mb-3">📁 Loại File</h3>
+          {Object.entries(fileTypes).length > 0 ? Object.entries(fileTypes).map(([k,v]) => (
+            <div key={k} className="flex items-center justify-between py-1.5">
+              <span>{fileBadge(k)}</span>
+              <div className="flex items-center gap-2">
+                <div className="w-32 bg-slate-700 rounded-full h-2">
+                  <div className="bg-green-500 h-2 rounded-full" style={{width:`${Math.min(100, (v/Math.max(1,...Object.values(fileTypes).reduce((a,b)=>a+b,0)))*100)}%`}}></div>
+                </div>
+                <span className="text-slate-400 text-sm w-8 text-right">{v}</span>
+              </div>
+            </div>
+          )) : <p className="text-slate-500">Chưa có dữ liệu</p>}
+        </div>
+      </div>
+
+      {/* Filters */}
+      <div className="bg-slate-800 rounded-xl p-5 border border-slate-700">
+        <div className="flex flex-wrap gap-3 mb-4">
+          <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="🔍 Tìm kiếm..." className="bg-slate-700 text-white px-4 py-2 rounded-lg border border-slate-600 focus:border-indigo-500 outline-none flex-1 min-w-[200px]" />
+          <select value={filterStatus} onChange={e=>setFilterStatus(e.target.value)} className="bg-slate-700 text-white px-4 py-2 rounded-lg border border-slate-600">
+            <option value="">Tất cả trạng thái</option>
+            <option value="queued">Chờ xử lý</option>
+            <option value="analyzing">Đang phân tích</option>
+            <option value="completed">Hoàn thành</option>
+            <option value="failed">Lỗi</option>
+          </select>
+          <select value={filterType} onChange={e=>setFilterType(e.target.value)} className="bg-slate-700 text-white px-4 py-2 rounded-lg border border-slate-600">
+            <option value="">Tất cả loại</option>
+            <option value="PE">PE</option>
+            <option value="ELF">ELF</option>
+            <option value="APK">APK</option>
+            <option value="DEB">DEB</option>
+          </select>
+        </div>
+
+        <h3 className="text-lg font-semibold text-white mb-3">📋 Phân Tích Gần Đây</h3>
+        {/* Desktop table */}
+        <div className="hidden md:block overflow-x-auto">
+          <table className="w-full text-left">
+            <thead>
+              <tr className="border-b border-slate-700 text-slate-400 text-sm">
+                <th className="pb-2 pr-4">Tên file</th>
+                <th className="pb-2 pr-4">Loại</th>
+                <th className="pb-2 pr-4">Nền tảng</th>
+                <th className="pb-2 pr-4">Trạng thái</th>
+                <th className="pb-2 pr-4">Ngày tạo</th>
+              </tr>
+            </thead>
+            <tbody>
+              {analyses.map(a => (
+                <tr key={a.id} onClick={() => nav('analysis', a.id)} className="border-b border-slate-700/50 hover:bg-slate-700/50 cursor-pointer transition-colors">
+                  <td className="py-3 pr-4 text-white font-medium">{a.filename || a.file_name || '—'}</td>
+                  <td className="py-3 pr-4">{fileBadge(a.file_type || a.type)}</td>
+                  <td className="py-3 pr-4">{platformIcon(a.platform)} <span className="text-slate-300">{a.platform||'—'}</span></td>
+                  <td className="py-3 pr-4">{statusBadge(a.status)}</td>
+                  <td className="py-3 pr-4 text-slate-400 text-sm">{a.created_at ? new Date(a.created_at).toLocaleString('vi-VN') : '—'}</td>
+                </tr>
+              ))}
+              {analyses.length===0 && <tr><td colSpan={5} className="py-8 text-center text-slate-500">Chưa có phân tích nào</td></tr>}
+            </tbody>
+          </table>
+        </div>
+        {/* Mobile cards */}
+        <div className="md:hidden space-y-3">
+          {analyses.map(a => (
+            <div key={a.id} onClick={() => nav('analysis', a.id)} className="bg-slate-700/50 rounded-xl p-4 active:bg-slate-600/50 cursor-pointer transition-colors">
+              <div className="flex items-start justify-between gap-2 mb-2">
+                <div className="flex-1 min-w-0">
+                  <p className="text-white font-medium truncate">{a.filename || a.file_name || '—'}</p>
+                  <p className="text-slate-400 text-xs mt-0.5">{a.created_at ? new Date(a.created_at).toLocaleString('vi-VN') : '—'}</p>
+                </div>
+                {statusBadge(a.status)}
+              </div>
+              <div className="flex items-center gap-2">
+                {fileBadge(a.file_type || a.type)}
+                <span className="text-slate-400 text-sm">{platformIcon(a.platform)} {a.platform||'—'}</span>
+              </div>
+            </div>
+          ))}
+          {analyses.length===0 && <div className="py-8 text-center text-slate-500">Chưa có phân tích nào</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Upload Page ──
+function UploadPage({ nav, addToast }) {
+  const [file, setFile] = useState(null);
+  const [profile, setProfile] = useState('quick');
+  const [dragOver, setDragOver] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const inputRef = useRef();
+
+  const profiles = [
+    { id:'quick', label:'⚡ Quét nhanh', desc:'Phân tích cơ bản, nhanh' },
+    { id:'deep', label:'🔬 Phân tích sâu', desc:'Kiểm tra chi tiết' },
+    { id:'runtime', label:'▶️ Runtime', desc:'Giám sát thời gian chạy' },
+    { id:'full', label:'📊 Full Report', desc:'Báo cáo đầy đủ' },
+  ];
+
+  const handleDrop = (e) => {
+    e.preventDefault(); setDragOver(false);
+    const f = e.dataTransfer.files[0];
+    if (f) setFile(f);
+  };
+
+  const handleUpload = async () => {
+    if (!file) { addToast('Vui lòng chọn file', 'error'); return; }
+    setUploading(true);
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('profile', profile);
+    try {
+      const res = await api.post('/api/upload', fd);
+      if (res.id || res.analysis_id) {
+        addToast('Tải lên thành công! Đang bắt đầu phân tích...', 'success');
+        setFile(null);
+        nav('analysis', res.id || res.analysis_id);
+      } else {
+        addToast(res.error || 'Tải lên thất bại', 'error');
+      }
+    } catch(e) { addToast('Lỗi kết nối', 'error'); }
+    setUploading(false);
+  };
+
+  return (
+    <div className="fade-in max-w-2xl mx-auto space-y-6">
+      <h2 className="text-2xl font-bold text-white">📤 Phân Tích Mới</h2>
+
+      {/* Drop Zone */}
+      <div
+        className={`border-2 border-dashed rounded-2xl p-12 text-center transition-colors cursor-pointer ${dragOver ? 'drop-zone-active' : 'border-slate-600 hover:border-slate-500'}`}
+        onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={handleDrop}
+        onClick={() => inputRef.current?.click()}
+      >
+        <input ref={inputRef} type="file" className="hidden" onChange={e => { if(e.target.files[0]) setFile(e.target.files[0]); }} />
+        {file ? (
+          <div>
+            <div className="text-4xl mb-3">📄</div>
+            <p className="text-white font-semibold text-lg">{file.name}</p>
+            <p className="text-slate-400">{(file.size/1024/1024).toFixed(2)} MB</p>
+          </div>
+        ) : (
+          <div>
+            <div className="text-5xl mb-3">📁</div>
+            <p className="text-white font-semibold text-lg">Kéo thả file vào đây</p>
+            <p className="text-slate-400 mt-1">hoặc click để chọn file</p>
+            <p className="text-slate-500 text-sm mt-2">Hỗ trợ: EXE, DLL, APK, DEB, ELF, DMG, IPA...</p>
+          </div>
+        )}
+      </div>
+
+      {/* Profile Selector */}
+      <div className="bg-slate-800 rounded-xl p-5 border border-slate-700">
+        <h3 className="text-lg font-semibold text-white mb-3">⚙️ Chế độ phân tích</h3>
+        <div className="grid grid-cols-2 gap-3">
+          {profiles.map(p => (
+            <button key={p.id} onClick={() => setProfile(p.id)} className={`p-4 rounded-xl border-2 text-left transition-all ${profile===p.id ? 'border-indigo-500 bg-indigo-500/10' : 'border-slate-700 hover:border-slate-600'}`}>
+              <div className="font-semibold text-white">{p.label}</div>
+              <div className="text-sm text-slate-400 mt-1">{p.desc}</div>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Start Button */}
+      <button onClick={handleUpload} disabled={uploading || !file} className={`w-full py-4 rounded-xl font-bold text-lg transition-all ${uploading || !file ? 'bg-slate-700 text-slate-500 cursor-not-allowed' : 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg'}`}>
+        {uploading ? '⏳ Đang tải lên...' : '🚀 Bắt đầu phân tích'}
+      </button>
+    </div>
+  );
+}
+
+// ── Analysis Detail ──
+function AnalysisDetail({ id, nav, addToast }) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [tab, setTab] = useState('overview');
+  const [selectedSrcFile, setSelectedSrcFile] = useState(0);
+  const [polling, setPolling] = useState(false);
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const d = await api.get(`/api/analyses/${id}`);
+      setData(d);
+      // Start polling if still analyzing
+      if (d.status === 'analyzing' || d.status === 'queued') {
+        setPolling(true);
+      } else {
+        setPolling(false);
+      }
+    } catch(e) { addToast('Lỗi tải phân tích', 'error'); }
+    setLoading(false);
+  };
+
+  useEffect(() => { load(); }, [id]);
+
+  // Auto-poll when analyzing
+  useEffect(() => {
+    if (!polling) return;
+    const interval = setInterval(async () => {
+      try {
+        const d = await api.get(`/api/analyses/${id}`);
+        setData(d);
+        if (d.status === 'completed' || d.status === 'failed') {
+          setPolling(false);
+          clearInterval(interval);
+        }
+      } catch(e) {}
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [polling, id]);
+
+  const handleDelete = async () => {
+    if (!confirm('Bạn có chắc muốn xóa?')) return;
+    try {
+      await api.delete(`/api/analyses/${id}`);
+      addToast('Đã xóa phân tích', 'success');
+      nav('dashboard');
+    } catch(e) { addToast('Lỗi xóa', 'error'); }
+  };
+
+  const handleReanalyze = async () => {
+    try {
+      await api.post(`/api/analyses/${id}/reanalyze`);
+      addToast('Đang phân tích lại...', 'success');
+      load();
+    } catch(e) { addToast('Lỗi', 'error'); }
+  };
+
+  const downloadReport = (fmt) => {
+    const content = fmt === 'json' ? JSON.stringify(data, null, 2) : (data.report || JSON.stringify(data, null, 2));
+    const blob = new Blob([content], { type: fmt==='json' ? 'application/json' : 'text/markdown' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `retool-report-${id}.${fmt==='json'?'json':'md'}`;
+    a.click();
+  };
+
+  if (loading) return <Spinner />;
+  if (!data) return <div className="text-red-400 text-center py-12">Không tìm thấy phân tích</div>;
+
+  const _wr = data.worker_results || {};
+  const _results = _wr.results || {};
+  const _dotnet = _results.dotnet || {};
+  const dotnetSourceFiles = Array.isArray(_dotnet.source_files) ? _dotnet.source_files : [];
+  const dotnetNamespaces = Array.isArray(_dotnet.namespaces) ? _dotnet.namespaces : [];
+  const dotnetClasses = Array.isArray(_dotnet.classes) ? _dotnet.classes : [];
+  const dotnetDecompiled = _dotnet.decompiled || false;
+
+  const result = data.result || data;
+  // Normalize: API may return objects instead of arrays
+  const _ts = result.tech_stack || result.techStack || {};
+  const techStack = Array.isArray(_ts) ? _ts : (typeof _ts === 'object' && _ts !== null ? Object.entries(_ts).filter(([k,v]) => v && v !== 'Unknown' && v !== 'Không rõ').map(([k,v]) => `${k}: ${v}`) : []);
+  const _f = result.features || {};
+  const features = Array.isArray(_f) ? _f : (typeof _f === 'object' && _f !== null ? Object.keys(_f).map(k => `${k}: ${typeof _f[k]==='object'?JSON.stringify(_f[k]).slice(0,100):_f[k]}`) : []);
+  const dependencies = Array.isArray(result.dependencies) ? result.dependencies : [];
+  const designPatterns = Array.isArray(result.design_patterns || result.designPatterns) ? (result.design_patterns || result.designPatterns) : [];
+  const componentDiagram = result.component_diagram || result.componentDiagram || '';
+  const apis = Array.isArray(result.apis || result.endpoints) ? (result.apis || result.endpoints) : [];
+  const _dec = result.decompiled_code || result.decompiledCode || result.source_code || {};
+  const decompiled = typeof _dec === 'string' ? _dec : (typeof _dec === 'object' && _dec !== null ? JSON.stringify(_dec, null, 2) : '');
+  const keyFunctions = Array.isArray(result.key_functions || result.keyFunctions) ? (result.key_functions || result.keyFunctions) : [];
+  const _na = result.network_activity || result.networkActivity || {};
+  const networkActivity = Array.isArray(_na) ? _na : (typeof _na === 'object' && _na !== null && Object.keys(_na).length > 0 ? _na : []);
+  const dataModels = Array.isArray(result.data_models || result.dataModels) ? (result.data_models || result.dataModels) : [];
+  const configValues = result.config_values || result.configValues || {};
+  const hardcodedSettings = result.hardcoded_settings || result.hardcodedSettings || {};
+  const report = result.report || data.report || result.ai_summary || data.ai_summary || '';
+  const threatScore = result.threat_score || result.threatScore || 0;
+  const _arch = result.architecture || {};
+  const archDisplay = typeof _arch === 'string' ? _arch : (typeof _arch === 'object' && _arch !== null ? Object.entries(_arch).filter(([k,v]) => v).map(([k,v]) => `${k}: ${v}`).join(' | ') : '—');
+
+  const tabs = [
+    { id:'overview', label:'📋 Tổng Quan' },
+    { id:'architecture', label:'🏗️ Kiến Trúc' },
+    { id:'apis', label:'🔌 APIs' },
+    { id:'source', label:'💻 Mã Nguồn' },
+    { id:'network', label:'🌐 Network' },
+    { id:'data', label:'🗄️ Cấu Trúc Dữ Liệu' },
+    { id:'report', label:'📝 Báo Cáo' },
+  ];
+
+  return (
+    <div className="fade-in space-y-6">
+      {/* Analyzing Banner */}
+      {polling && (
+        <div className="bg-indigo-600/20 border border-indigo-500/40 rounded-xl p-4 flex items-center gap-4 animate-pulse">
+          <div className="relative">
+            <div className="w-10 h-10 border-4 border-indigo-500/30 border-t-indigo-400 rounded-full animate-spin"></div>
+          </div>
+          <div>
+            <p className="text-indigo-300 font-semibold">⏳ Đang phân tích...</p>
+            <p className="text-slate-400 text-sm">Worker đang xử lý file. Kết quả sẽ tự động cập nhật khi hoàn thành.</p>
+          </div>
+        </div>
+      )}
+
+      {/* Header */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div>
+          <button onClick={() => nav('dashboard')} className="text-indigo-400 hover:text-indigo-300 text-sm mb-2">← Quay lại</button>
+          <h2 className="text-xl sm:text-2xl font-bold text-white flex items-center gap-2 flex-wrap">
+            {fileBadge(data.file_type || result.file_type)} <span className="break-all">{data.filename || result.filename || 'Phân tích'}</span>
+          </h2>
+          <div className="flex items-center gap-3 mt-1 flex-wrap">
+            {statusBadge(data.status)}
+            <span className="text-slate-400 text-sm">{platformIcon(data.platform || result.platform)} {data.platform || result.platform || '—'}</span>
+          </div>
+        </div>
+        <div className="flex gap-2">
+          <button onClick={handleReanalyze} className="px-3 py-2 bg-yellow-600 hover:bg-yellow-500 text-white rounded-lg text-sm">🔄 Phân tích lại</button>
+          <button onClick={handleDelete} className="px-3 py-2 bg-red-600 hover:bg-red-500 text-white rounded-lg text-sm">🗑️ Xóa</button>
+        </div>
+      </div>
+
+      {/* Tabs */}
+      <div className="flex gap-1 overflow-x-auto border-b border-slate-700 pb-0 scrollbar-hide" style={{WebkitOverflowScrolling:'touch'}}>
+        {tabs.map(t => (
+          <button key={t.id} onClick={() => setTab(t.id)} className={`px-4 py-2.5 text-sm font-medium whitespace-nowrap rounded-t-lg transition-colors ${tab===t.id ? 'bg-slate-800 text-indigo-400 border-b-2 border-indigo-500' : 'text-slate-400 hover:text-slate-200'}`}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {/* Tab Content */}
+      <div className="bg-slate-800 rounded-xl p-6 border border-slate-700 min-h-[400px]">
+        {/* Overview */}
+        {tab === 'overview' && (
+          <div className="space-y-6">
+            {/* File Info */}
+            <div className="grid md:grid-cols-2 gap-4">
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-2">📄 Thông tin file</h3>
+                <div className="space-y-1 text-sm">
+                  <p className="text-slate-300"><span className="text-slate-500">Tên:</span> {data.filename || result.filename}</p>
+                  <p className="text-slate-300"><span className="text-slate-500">Loại:</span> {data.file_type || result.file_type}</p>
+                  <p className="text-slate-300"><span className="text-slate-500">Kích thước:</span> {data.file_size || result.file_size ? `${((data.file_size||result.file_size)/1024/1024).toFixed(2)} MB` : '—'}</p>
+                  <p className="text-slate-300"><span className="text-slate-500">Nền tảng:</span> {platformIcon(data.platform||result.platform)} {data.platform || result.platform}</p>
+                  <p className="text-slate-300"><span className="text-slate-500">Kiến trúc:</span> {archDisplay}</p>
+                </div>
+              </div>
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-2">🎯 Mức đe dọa</h3>
+                <div className="flex items-center gap-4">
+                  <div className={`text-5xl font-bold ${threatScore > 7 ? 'text-red-500' : threatScore > 4 ? 'text-yellow-500' : 'text-green-500'}`}>
+                    {threatScore}/10
+                  </div>
+                  <div className="flex-1">
+                    <div className="w-full bg-slate-700 rounded-full h-4">
+                      <div className={`h-4 rounded-full ${threatScore > 7 ? 'bg-red-500' : threatScore > 4 ? 'bg-yellow-500' : 'bg-green-500'}`} style={{width:`${threatScore*10}%`}}></div>
+                    </div>
+                    <p className="text-slate-400 text-sm mt-1">{threatScore > 7 ? '⚠️ Nguy hiểm' : threatScore > 4 ? '⚡ Trung bình' : '✅ An toàn'}</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Tech Stack */}
+            {techStack.length > 0 && (
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-2">🛠️ Tech Stack</h3>
+                <div className="flex flex-wrap gap-2">
+                  {techStack.map((t,i) => <span key={i} className="px-3 py-1 bg-indigo-600/30 text-indigo-300 rounded-full text-sm border border-indigo-500/30">{typeof t==='string'?t:t.name||t}</span>)}
+                </div>
+              </div>
+            )}
+
+            {/* Architecture Summary */}
+            {result.architecture_summary && (
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-2">📐 Tóm tắt kiến trúc</h3>
+                <p className="text-slate-300">{result.architecture_summary}</p>
+              </div>
+            )}
+
+            {/* Features */}
+            {features.length > 0 && (
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-2">✨ Tính năng phát hiện</h3>
+                <div className="grid md:grid-cols-2 gap-2">
+                  {features.map((f,i) => (
+                    <div key={i} className="flex items-start gap-2 text-slate-300 text-sm">
+                      <span className="text-green-400 mt-0.5">✓</span>
+                      {typeof f==='string'?f:f.name||JSON.stringify(f)}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Extraction Results */}
+            {data.worker_results && data.worker_results.extraction && (
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-2">📦 Auto-Extraction</h3>
+                <div className="bg-slate-900 rounded-lg p-4">
+                  {(() => {
+                    const ext = data.worker_results.extraction;
+                    const det = ext.detection || {};
+                    return (
+                      <div className="space-y-2 text-sm">
+                        <p className="text-slate-300"><span className="text-slate-500">Phát hiện:</span> <span className="text-indigo-400 font-mono">{det.sub_type || det.type || 'unknown'}</span> ({det.confidence || 0}% confidence)</p>
+                        <p className="text-slate-300"><span className="text-slate-500">Phương pháp:</span> {ext.method || 'none'}</p>
+                        <p className="text-slate-300"><span className="text-slate-500">Files extracted:</span> <span className="text-green-400 font-bold">{ext.total_extracted || 0}</span> ({ext.total_interesting || 0} interesting)</p>
+                      </div>
+                    );
+                  })()}
+                </div>
+              </div>
+            )}
+
+            {/* Extracted Payload Analysis */}
+            {data.worker_results && Array.isArray(data.worker_results.children) && data.worker_results.children.length > 0 && (
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-2">🔬 Payload Analysis ({data.worker_results.children.length} files)</h3>
+                <div className="space-y-3">
+                  {data.worker_results.children.map((child, ci) => (
+                    <div key={ci} className="bg-slate-900 rounded-lg p-4 border border-slate-700">
+                      <div className="flex items-center justify-between mb-2">
+                        <div className="flex items-center gap-2">
+                          <span className="text-indigo-400 font-mono text-sm font-bold">{child.filename}</span>
+                          {child.file_type && <span className="px-2 py-0.5 bg-blue-600/20 text-blue-400 text-xs rounded">{child.file_type}</span>}
+                          {child.results && child.results.dotnet && child.results.dotnet.decompiled && (
+                            <span className="px-2 py-0.5 bg-green-600/20 text-green-400 text-xs rounded">✓ .NET Decompiled</span>
+                          )}
+                        </div>
+                        <span className="text-slate-500 text-xs">{child.size ? `${(child.size/1024).toFixed(1)} KB` : ''}</span>
+                      </div>
+
+                      {/* Binary info */}
+                      {child.results && child.results.binary && (
+                        <div className="text-xs text-slate-400 mb-2">
+                          {child.results.binary.language && <span>Language: <span className="text-slate-300">{child.results.binary.language}</span> • </span>}
+                          {child.results.binary.sections && <span>{child.results.binary.sections.length} sections • </span>}
+                          {child.results.binary.imports && <span>{child.results.binary.imports.length} imports</span>}
+                        </div>
+                      )}
+
+                      {/* .NET Namespaces */}
+                      {child.results && child.results.dotnet && child.results.dotnet.namespaces && child.results.dotnet.namespaces.length > 0 && (
+                        <div className="mb-2">
+                          <div className="flex flex-wrap gap-1">
+                            {child.results.dotnet.namespaces.map((ns, ni) => (
+                              <span key={ni} className="px-1.5 py-0.5 bg-slate-800 text-indigo-300 text-[10px] rounded font-mono">{ns}</span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Key strings */}
+                      {child.strings_sample && (
+                        <details className="text-xs">
+                          <summary className="text-slate-500 cursor-pointer hover:text-slate-400">Strings sample...</summary>
+                          <pre className="mt-1 bg-slate-800 rounded p-2 text-slate-400 overflow-auto max-h-[200px] font-mono whitespace-pre">{child.strings_sample.slice(0, 2000)}</pre>
+                        </details>
+                      )}
+
+                      {/* Script/Config content */}
+                      {child.content && (
+                        <details className="text-xs">
+                          <summary className="text-slate-500 cursor-pointer hover:text-slate-400">Content preview...</summary>
+                          <pre className="mt-1 bg-slate-800 rounded p-2 text-slate-400 overflow-auto max-h-[300px] font-mono whitespace-pre">{child.content.slice(0, 5000)}</pre>
+                        </details>
+                      )}
+
+                      {/* JS Deep Analysis */}
+                      {child.results && child.results.js_analysis && (() => {
+                        const js = child.results.js_analysis;
+                        return (
+                          <div className="mt-3 space-y-2">
+                            <div className="text-xs text-indigo-400 font-semibold">🔍 JS Deep Analysis — {js.lines} lines, {js.functions?.length || 0} functions</div>
+
+                            {/* Functions */}
+                            {js.functions && js.functions.length > 0 && (
+                              <details className="text-xs">
+                                <summary className="text-green-400 cursor-pointer hover:text-green-300 font-semibold">⚡ Functions ({js.functions.length})</summary>
+                                <div className="mt-1 bg-slate-800 rounded p-2 max-h-[300px] overflow-y-auto font-mono">
+                                  {js.functions.slice(0, 50).map((fn, fi) => (
+                                    <div key={fi} className="text-slate-300 py-0.5 hover:bg-slate-700 px-1 rounded">
+                                      <span className="text-slate-500 text-[10px] w-10 inline-block">L{fn.line}</span>
+                                      {fn.async && <span className="text-yellow-400">async </span>}
+                                      <span className="text-green-300">{fn.name}</span>
+                                      <span className="text-slate-500">({(fn.params || '').slice(0, 40)})</span>
+                                      {fn.type && <span className="text-slate-600 ml-1 text-[10px]">[{fn.type}]</span>}
+                                    </div>
+                                  ))}
+                                  {js.functions.length > 50 && <div className="text-slate-500 mt-1">... và {js.functions.length - 50} functions khác</div>}
+                                </div>
+                              </details>
+                            )}
+
+                            {/* HTTP Routes */}
+                            {js.http_routes && js.http_routes.length > 0 && (
+                              <details className="text-xs">
+                                <summary className="text-cyan-400 cursor-pointer hover:text-cyan-300 font-semibold">🌐 HTTP Routes ({js.http_routes.length})</summary>
+                                <div className="mt-1 bg-slate-800 rounded p-2 max-h-[300px] overflow-y-auto font-mono">
+                                  {(() => {
+                                    const seen = new Set();
+                                    return js.http_routes.filter(r => {
+                                      const key = r.method + ' ' + r.path;
+                                      if (seen.has(key)) return false;
+                                      seen.add(key);
+                                      return true;
+                                    }).slice(0, 40).map((r, ri) => (
+                                      <div key={ri} className="text-slate-300 py-0.5 hover:bg-slate-700 px-1 rounded">
+                                        <span className="text-slate-500 text-[10px] w-10 inline-block">L{r.line}</span>
+                                        <span className="text-cyan-300 font-bold">{r.method}</span>
+                                        <span className="text-yellow-300 ml-1">{r.path}</span>
+                                      </div>
+                                    ));
+                                  })()}
+                                </div>
+                              </details>
+                            )}
+
+                            {/* IPC Handlers */}
+                            {js.ipc_handlers && js.ipc_handlers.length > 0 && (
+                              <details className="text-xs">
+                                <summary className="text-purple-400 cursor-pointer hover:text-purple-300 font-semibold">📡 IPC Handlers ({js.ipc_handlers.length})</summary>
+                                <div className="mt-1 bg-slate-800 rounded p-2 max-h-[200px] overflow-y-auto font-mono">
+                                  {js.ipc_handlers.map((h, hi) => (
+                                    <div key={hi} className="text-slate-300 py-0.5">
+                                      <span className="text-slate-500 text-[10px] w-10 inline-block">L{h.line}</span>
+                                      <span className="text-purple-300">{h.type}</span>
+                                      <span className="text-yellow-300 ml-1">{h.channel}</span>
+                                    </div>
+                                  ))}
+                                </div>
+                              </details>
+                            )}
+
+                            {/* Crypto Operations */}
+                            {js.crypto_ops && js.crypto_ops.length > 0 && (
+                              <details className="text-xs">
+                                <summary className="text-red-400 cursor-pointer hover:text-red-300 font-semibold">🔐 Crypto ({js.crypto_ops.length})</summary>
+                                <div className="mt-1 bg-slate-800 rounded p-2 max-h-[200px] overflow-y-auto font-mono">
+                                  {(() => {
+                                    const seen = new Set();
+                                    return js.crypto_ops.filter(c => {
+                                      if (seen.has(c.operation)) return false;
+                                      seen.add(c.operation);
+                                      return true;
+                                    }).map((c, ci) => (
+                                      <div key={ci} className="text-slate-300 py-0.5">
+                                        <span className="text-slate-500 text-[10px] w-10 inline-block">L{c.line}</span>
+                                        <span className="text-red-300">{c.operation}</span>
+                                        <span className="text-slate-500 ml-1">{(c.context || '').slice(0, 60)}</span>
+                                      </div>
+                                    ));
+                                  })()}
+                                </div>
+                              </details>
+                            )}
+
+                            {/* API Keys / Secrets */}
+                            {js.api_keys && js.api_keys.length > 0 && (
+                              <details className="text-xs" open>
+                                <summary className="text-orange-400 cursor-pointer hover:text-orange-300 font-semibold">🔑 Secrets ({js.api_keys.length})</summary>
+                                <div className="mt-1 bg-red-900/30 border border-red-800 rounded p-2 font-mono">
+                                  {js.api_keys.map((k, ki) => (
+                                    <div key={ki} className="text-slate-300 py-0.5">
+                                      <span className="text-slate-500 text-[10px] w-10 inline-block">L{k.line}</span>
+                                      <span className="text-orange-300">[{k.type}]</span>
+                                      <span className="text-red-300 ml-1 font-bold">{k.value_preview}</span>
+                                    </div>
+                                  ))}
+                                </div>
+                              </details>
+                            )}
+
+                            {/* Suspicious Patterns */}
+                            {js.suspicious && js.suspicious.length > 0 && (
+                              <details className="text-xs">
+                                <summary className="text-yellow-400 cursor-pointer hover:text-yellow-300 font-semibold">⚠️ Suspicious ({js.suspicious.length})</summary>
+                                <div className="mt-1 bg-slate-800 rounded p-2 max-h-[200px] overflow-y-auto font-mono">
+                                  {(() => {
+                                    const seen = new Set();
+                                    return js.suspicious.filter(s => {
+                                      if (seen.has(s.pattern)) return false;
+                                      seen.add(s.pattern);
+                                      return true;
+                                    }).map((s, si) => (
+                                      <div key={si} className="text-slate-300 py-0.5">
+                                        <span className="text-slate-500 text-[10px] w-10 inline-block">L{s.line}</span>
+                                        <span className="text-yellow-300">{s.pattern}</span>
+                                        <span className="text-slate-500 ml-1">(x{s.count})</span>
+                                      </div>
+                                    ));
+                                  })()}
+                                </div>
+                              </details>
+                            )}
+
+                            {/* Evidence Sources (URLs) */}
+                            {js.evidence_sources && js.evidence_sources.length > 0 && (
+                              <details className="text-xs">
+                                <summary className="text-blue-400 cursor-pointer hover:text-blue-300 font-semibold">🔗 URLs ({js.evidence_sources.length})</summary>
+                                <div className="mt-1 bg-slate-800 rounded p-2 max-h-[200px] overflow-y-auto font-mono">
+                                  {js.evidence_sources.slice(0, 20).map((u, ui) => (
+                                    <div key={ui} className="text-slate-300 py-0.5 truncate">
+                                      <span className="text-slate-500 text-[10px] w-10 inline-block">L{u.line}</span>
+                                      <span className="text-blue-300">{u.url}</span>
+                                    </div>
+                                  ))}
+                                </div>
+                              </details>
+                            )}
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+        {tab === 'architecture' && (
+          <div className="space-y-6">
+            {dependencies.length > 0 && (
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-3">📦 Dependencies</h3>
+                <div className="bg-slate-900 rounded-lg p-4 font-mono text-sm max-h-80 overflow-y-auto">
+                  {dependencies.map((d,i) => (
+                    <div key={i} className="text-slate-300 py-1">
+                      <span className="text-indigo-400">├──</span> {typeof d==='string'?d:d.name||JSON.stringify(d)}
+                      {typeof d==='object'&&d.version && <span className="text-slate-500 ml-2">@{d.version}</span>}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {designPatterns.length > 0 && (
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-3">🎯 Design Patterns</h3>
+                <div className="flex flex-wrap gap-2">
+                  {designPatterns.map((p,i) => <span key={i} className="px-3 py-1.5 bg-purple-600/20 text-purple-300 rounded-lg text-sm border border-purple-500/30">{typeof p==='string'?p:p.name||JSON.stringify(p)}</span>)}
+                </div>
+              </div>
+            )}
+            {componentDiagram && (
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-3">🗺️ Sơ đồ thành phần</h3>
+                <pre className="bg-slate-900 rounded-lg p-4 text-sm text-slate-300 overflow-x-auto font-mono whitespace-pre-wrap">{componentDiagram}</pre>
+              </div>
+            )}
+            {dependencies.length===0 && !componentDiagram && designPatterns.length===0 && <p className="text-slate-500">Không có dữ liệu kiến trúc</p>}
+          </div>
+        )}
+
+        {/* APIs */}
+        {tab === 'apis' && (
+          <div>
+            <h3 className="text-lg font-semibold text-white mb-3">🔌 API Endpoints</h3>
+            {apis.length > 0 ? (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left">
+                  <thead>
+                    <tr className="border-b border-slate-700 text-slate-400 text-sm">
+                      <th className="pb-2 pr-4">Method</th>
+                      <th className="pb-2 pr-4">URL</th>
+                      <th className="pb-2 pr-4">Loại</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {apis.map((a,i) => (
+                      <tr key={i} className="border-b border-slate-700/50">
+                        <td className="py-2 pr-4">
+                          <span className={`px-2 py-0.5 rounded text-xs font-bold text-white ${
+                            (a.method||'GET')==='GET'?'bg-green-600':(a.method||'')==='POST'?'bg-blue-600':(a.method||'')==='PUT'?'bg-yellow-600':(a.method||'')==='DELETE'?'bg-red-600':'bg-slate-600'
+                          }`}>{a.method||'GET'}</span>
+                        </td>
+                        <td className="py-2 pr-4 text-slate-300 font-mono text-sm">{a.url||a.endpoint||a.path||'—'}</td>
+                        <td className="py-2 pr-4 text-slate-400 text-sm">{a.type||a.category||'—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : <p className="text-slate-500">Không phát hiện API</p>}
+          </div>
+        )}
+
+        {/* Source Code */}
+        {tab === 'source' && (
+          <div className="space-y-6">
+            {/* .NET Decompiled Source */}
+            {dotnetDecompiled && dotnetSourceFiles.length > 0 ? (
+              <div>
+                <div className="flex flex-wrap items-center gap-3 mb-4">
+                  <h3 className="text-lg font-semibold text-white">💻 Mã nguồn C# (ILSpy Decompiled)</h3>
+                  <span className="px-2 py-0.5 bg-green-600/20 text-green-400 text-xs rounded-full">
+                    {_dotnet.total_cs_files || dotnetSourceFiles.length} files • {_dotnet.total_lines || '?'} dòng
+                  </span>
+                </div>
+
+                {/* Namespaces & Classes */}
+                {dotnetNamespaces.length > 0 && (
+                  <div className="mb-4">
+                    <p className="text-sm text-slate-400 mb-1">📦 Namespaces:</p>
+                    <div className="flex flex-wrap gap-1">
+                      {dotnetNamespaces.map((ns, i) => (
+                        <span key={i} className="px-2 py-0.5 bg-slate-800 text-indigo-300 text-xs rounded font-mono">{ns}</span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* File selector + code viewer */}
+                <div className="flex flex-col lg:flex-row gap-3">
+                  {/* File list sidebar */}
+                  <div className="lg:w-64 flex-shrink-0">
+                    <p className="text-sm text-slate-400 mb-2">📁 Files ({dotnetSourceFiles.length}):</p>
+                    <div className="bg-slate-900 rounded-lg max-h-[600px] overflow-y-auto">
+                      {dotnetSourceFiles.map((sf, i) => (
+                        <button
+                          key={i}
+                          onClick={() => setSelectedSrcFile(i)}
+                          className={`w-full text-left px-3 py-2 text-xs font-mono border-b border-slate-800 transition-colors ${
+                            selectedSrcFile === i
+                              ? 'bg-indigo-600/20 text-indigo-300'
+                              : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+                          }`}
+                        >
+                          <div className="truncate">{sf.path}</div>
+                          <div className="text-slate-600 text-[10px]">{sf.lines} lines</div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Code viewer */}
+                  <div className="flex-1 min-w-0">
+                    {dotnetSourceFiles[selectedSrcFile] && (
+                      <div>
+                        <div className="flex items-center justify-between mb-2">
+                          <p className="text-sm text-indigo-400 font-mono truncate">{dotnetSourceFiles[selectedSrcFile].path}</p>
+                          <span className="text-xs text-slate-500">{dotnetSourceFiles[selectedSrcFile].lines} dòng</span>
+                        </div>
+                        <pre className="bg-slate-900 rounded-lg p-4 text-sm text-slate-300 overflow-auto max-h-[600px] font-mono whitespace-pre leading-relaxed">
+                          {dotnetSourceFiles[selectedSrcFile].content.split('\n').map((line, i) => (
+                            <div key={i} className="flex hover:bg-slate-800/50">
+                              <span className="text-slate-600 w-12 text-right pr-3 select-none flex-shrink-0">{i+1}</span>
+                              <span className="flex-1 break-all">{line}</span>
+                            </div>
+                          ))}
+                        </pre>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ) : _dotnet.error ? (
+              <div className="bg-red-900/20 border border-red-500/30 rounded-xl p-4">
+                <p className="text-red-400 font-semibold">❌ Lỗi decompile .NET</p>
+                <p className="text-red-300 text-sm mt-1">{_dotnet.error}</p>
+              </div>
+            ) : (
+              <>
+                {/* Ghidra Results — Native Binary */}
+                {(() => {
+                  const _ghidra = _results.ghidra || {};
+                  const ghidraDecompiled = Array.isArray(_ghidra.decompiled) ? _ghidra.decompiled : [];
+                  const interesting = _ghidra.interesting_functions || {};
+                  const ghidraFunctions = Array.isArray(_ghidra.functions) ? _ghidra.functions : [];
+                  const totalFuncs = _ghidra.total_functions || ghidraFunctions.length;
+
+                  if (ghidraDecompiled.length > 0 || ghidraFunctions.length > 0) {
+                    return (
+                      <div className="space-y-6">
+                        {/* Stats */}
+                        <div className="flex flex-wrap gap-3">
+                          <span className="px-3 py-1 bg-indigo-600/20 text-indigo-300 rounded-full text-sm">
+                            🔧 {totalFuncs} functions total
+                          </span>
+                          <span className="px-3 py-1 bg-green-600/20 text-green-300 rounded-full text-sm">
+                            💻 {ghidraDecompiled.length} decompiled
+                          </span>
+                          {_ghidra.entry_point && (
+                            <span className="px-3 py-1 bg-yellow-600/20 text-yellow-300 rounded-full text-sm">
+                              📍 Entry: {_ghidra.entry_point}
+                            </span>
+                          )}
+                        </div>
+
+                        {/* Interesting Functions */}
+                        {Object.keys(interesting).length > 0 && (
+                          <div>
+                            <h3 className="text-lg font-semibold text-white mb-3">🎯 Interesting Functions</h3>
+                            <div className="space-y-3">
+                              {Object.entries(interesting).map(([cat, funcs]) => (
+                                <div key={cat} className="bg-slate-900 rounded-lg p-4">
+                                  <p className="text-sm font-semibold text-indigo-400 mb-2">
+                                    {cat === 'crypto' && '🔐'} {cat === 'network' && '🌐'} {cat === 'file_io' && '📁'}
+                                    {cat === 'registry' && '📋'} {cat === 'process_injection' && '💉'} {cat === 'anti_debug' && '🛡️'}
+                                    {' '}{cat.replace('_', ' ')} ({funcs.length})
+                                  </p>
+                                  <div className="grid md:grid-cols-2 gap-1">
+                                    {funcs.slice(0, 10).map((f, fi) => (
+                                      <div key={fi} className="text-xs font-mono text-slate-300 bg-slate-800 rounded px-2 py-1">
+                                        {f.name} <span className="text-slate-500">@ {f.address}</span>
+                                        {f.callees && f.callees.length > 0 && (
+                                          <span className="text-slate-600"> → {f.callees.slice(0, 3).join(', ')}</span>
+                                        )}
+                                      </div>
+                                    ))}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Decompiled Functions */}
+                        {ghidraDecompiled.length > 0 && (
+                          <div>
+                            <h3 className="text-lg font-semibold text-white mb-3">💻 Decompiled Code ({ghidraDecompiled.length} functions)</h3>
+                            <div className="space-y-3">
+                              {ghidraDecompiled.slice(0, 50).map((f, fi) => (
+                                <details key={fi} className="bg-slate-900 rounded-lg border border-slate-700">
+                                  <summary className="px-4 py-2 cursor-pointer hover:bg-slate-800 rounded-lg flex items-center justify-between">
+                                    <span className="text-indigo-400 font-mono text-sm">{f.name}</span>
+                                    <div className="flex items-center gap-2">
+                                      <span className="text-slate-500 text-xs">{f.size} bytes</span>
+                                      <span className="text-slate-600 text-xs">@ {f.address}</span>
+                                    </div>
+                                  </summary>
+                                  {f.code && (
+                                    <pre className="px-4 pb-3 text-sm text-slate-300 overflow-auto max-h-[400px] font-mono whitespace-pre leading-relaxed border-t border-slate-700 pt-2">
+                                      {f.code.split('\n').map((line, li) => (
+                                        <div key={li} className="flex hover:bg-slate-800/50">
+                                          <span className="text-slate-600 w-10 text-right pr-3 select-none flex-shrink-0">{li+1}</span>
+                                          <span className="flex-1">{line}</span>
+                                        </div>
+                                      ))}
+                                    </pre>
+                                  )}
+                                </details>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  }
+
+                  // Fallback: legacy decompiled view
+                  return (
+                    <>
+                      {keyFunctions.length > 0 && (
+                        <div>
+                          <h3 className="text-lg font-semibold text-white mb-3">⚡ Hàm chính</h3>
+                          <div className="grid md:grid-cols-2 gap-2">
+                            {keyFunctions.map((f,i) => (
+                              <div key={i} className="bg-slate-900 rounded-lg px-4 py-2 text-sm">
+                                <span className="text-indigo-400 font-mono">{typeof f==='string'?f:f.name||JSON.stringify(f)}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      <div>
+                        <h3 className="text-lg font-semibold text-white mb-3">💻 Mã nguồn (Decompiled)</h3>
+                        {decompiled ? (
+                          <pre className="bg-slate-900 rounded-lg p-4 text-sm text-slate-300 overflow-auto max-h-[500px] font-mono whitespace-pre-wrap leading-relaxed">
+                            {decompiled.split('\n').map((line, i) => (
+                              <div key={i} className="flex"><span className="text-slate-600 w-10 text-right pr-3 select-none flex-shrink-0">{i+1}</span><span className="flex-1">{line}</span></div>
+                            ))}
+                          </pre>
+                        ) : <p className="text-slate-500">Không có mã nguồn</p>}
+                      </div>
+                    </>
+                  );
+                })()}
+              </>
+            )}
+          </div>
+        )}
+
+        {/* Network */}
+        {tab === 'network' && (
+          <div className="space-y-4">
+            <h3 className="text-lg font-semibold text-white mb-3">🌐 Hoạt động mạng & Dynamic Analysis</h3>
+            {Array.isArray(networkActivity) && networkActivity.length > 0 ? (
+              <div className="space-y-2">
+                {networkActivity.map((n,i) => (
+                  <div key={i} className="bg-slate-900 rounded-lg p-3 flex items-center justify-between">
+                    <div>
+                      <span className="text-indigo-400 font-mono text-sm">{n.host || n.url || n.domain || '—'}</span>
+                      {n.port && <span className="text-slate-500 ml-2">:{n.port}</span>}
+                    </div>
+                    <span className="text-slate-400 text-sm">{n.type || n.protocol || '—'}</span>
+                  </div>
+                ))}
+              </div>
+            ) : typeof networkActivity === 'object' && networkActivity !== null && Object.keys(networkActivity).length > 0 ? (
+              <div className="space-y-4">
+                {networkActivity.syscalls && (
+                  <div>
+                    <h4 className="text-md font-semibold text-slate-300 mb-2">📡 System Calls (Top 30)</h4>
+                    <div className="bg-slate-900 rounded-lg p-4 font-mono text-sm max-h-60 overflow-y-auto">
+                      {Object.entries(networkActivity.syscalls).map(([name, count], i) => (
+                        <div key={i} className="flex justify-between py-1 border-b border-slate-800">
+                          <span className="text-indigo-400">{name}</span>
+                          <span className="text-slate-400">{count}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {networkActivity.network_operations && networkActivity.network_operations.length > 0 && (
+                  <div>
+                    <h4 className="text-md font-semibold text-slate-300 mb-2">🔌 Network Operations</h4>
+                    <div className="bg-slate-900 rounded-lg p-4 font-mono text-xs max-h-40 overflow-y-auto">
+                      {networkActivity.network_operations.map((op, i) => <div key={i} className="text-slate-400 py-0.5">{op}</div>)}
+                    </div>
+                  </div>
+                )}
+                {networkActivity.file_operations && networkActivity.file_operations.length > 0 && (
+                  <div>
+                    <h4 className="text-md font-semibold text-slate-300 mb-2">📁 File Operations</h4>
+                    <div className="bg-slate-900 rounded-lg p-4 font-mono text-xs max-h-40 overflow-y-auto">
+                      {networkActivity.file_operations.map((op, i) => <div key={i} className="text-slate-400 py-0.5">{op}</div>)}
+                    </div>
+                  </div>
+                )}
+                {networkActivity.stdout && (
+                  <div>
+                    <h4 className="text-md font-semibold text-slate-300 mb-2">📤 stdout</h4>
+                    <pre className="bg-slate-900 rounded-lg p-4 text-sm text-green-300 font-mono whitespace-pre-wrap">{networkActivity.stdout}</pre>
+                  </div>
+                )}
+                {networkActivity.stderr && (
+                  <div>
+                    <h4 className="text-md font-semibold text-slate-300 mb-2">📥 stderr</h4>
+                    <pre className="bg-slate-900 rounded-lg p-4 text-sm text-red-300 font-mono whitespace-pre-wrap">{networkActivity.stderr}</pre>
+                  </div>
+                )}
+              </div>
+            ) : <p className="text-slate-500">Không phát hiện hoạt động mạng</p>}
+          </div>
+        )}
+
+        {/* Data Structures */}
+        {tab === 'data' && (
+          <div className="space-y-6">
+            {dataModels.length > 0 && (
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-3">📊 Models dữ liệu</h3>
+                <div className="space-y-2">
+                  {dataModels.map((m,i) => (
+                    <div key={i} className="bg-slate-900 rounded-lg p-3">
+                      <span className="text-green-400 font-mono text-sm font-bold">{typeof m==='string'?m:m.name||JSON.stringify(m)}</span>
+                      {typeof m==='object'&&m.fields && <div className="mt-1 text-slate-400 text-xs">{Array.isArray(m.fields)?m.fields.join(', '):JSON.stringify(m.fields)}</div>}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {Object.keys(configValues).length > 0 && (
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-3">⚙️ Cấu hình</h3>
+                <div className="bg-slate-900 rounded-lg p-4 font-mono text-sm">
+                  {Object.entries(configValues).map(([k,v]) => (
+                    <div key={k} className="py-1"><span className="text-yellow-400">{k}</span><span className="text-slate-500"> = </span><span className="text-green-400">{typeof v==='object'?JSON.stringify(v):String(v)}</span></div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {Object.keys(hardcodedSettings).length > 0 && (
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-3">🔒 Hardcoded Settings</h3>
+                <div className="bg-slate-900 rounded-lg p-4 font-mono text-sm">
+                  {Object.entries(hardcodedSettings).map(([k,v]) => (
+                    <div key={k} className="py-1"><span className="text-red-400">{k}</span><span className="text-slate-500"> = </span><span className="text-orange-400">{typeof v==='object'?JSON.stringify(v):String(v)}</span></div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {dataModels.length===0 && Object.keys(configValues).length===0 && Object.keys(hardcodedSettings).length===0 && <p className="text-slate-500">Không có dữ liệu cấu trúc</p>}
+          </div>
+        )}
+
+        {/* Report */}
+        {tab === 'report' && (
+          <div className="space-y-4">
+            <div className="flex gap-2">
+              <button onClick={() => downloadReport('json')} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-sm">📥 Export JSON</button>
+              <button onClick={() => downloadReport('md')} className="px-4 py-2 bg-green-600 hover:bg-green-500 text-white rounded-lg text-sm">📥 Export Markdown</button>
+            </div>
+            {report ? (
+              <div className="prose prose-invert max-w-none bg-slate-900 rounded-lg p-6 text-slate-300 leading-relaxed" dangerouslySetInnerHTML={{__html: renderMarkdown(report)}} />
+            ) : <p className="text-slate-500">Chưa có báo cáo</p>}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Main App ──
+function App() {
+  const [page, setPage] = useState('dashboard');
+  const [analysisId, setAnalysisId] = useState(null);
+  const [toasts, setToasts] = useState([]);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  const addToast = (msg, type='info') => {
+    const id = ++toastId;
+    setToasts(t => [...t, { id, msg, type }]);
+    setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), 4000);
+  };
+  const removeToast = (id) => setToasts(t => t.filter(x => x.id !== id));
+
+  const nav = (p, aid) => {
+    setPage(p);
+    setAnalysisId(aid || null);
+    window.location.hash = p === 'analysis' ? `analysis/${aid}` : p;
+  };
+
+  // Hash routing
+  useEffect(() => {
+    const handleHash = () => {
+      const hash = window.location.hash.slice(1) || 'dashboard';
+      if (hash.startsWith('analysis/')) {
+        setPage('analysis');
+        setAnalysisId(hash.split('/')[1]);
+      } else {
+        setPage(hash);
+        setAnalysisId(null);
+      }
+    };
+    handleHash();
+    window.addEventListener('hashchange', handleHash);
+    return () => window.removeEventListener('hashchange', handleHash);
+  }, []);
+
+  return (
+    <div className="flex min-h-screen bg-slate-900 text-slate-100">
+      <Sidebar page={page} nav={nav} isOpen={sidebarOpen} setIsOpen={setSidebarOpen} />
+      <main className="flex-1 overflow-y-auto">
+        {/* Mobile top bar */}
+        <div className="lg:hidden sticky top-0 z-30 bg-slate-900/95 backdrop-blur border-b border-slate-700 px-4 py-3 flex items-center gap-3">
+          <button onClick={() => setSidebarOpen(true)} className="text-slate-300 hover:text-white p-1">
+            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" /></svg>
+          </button>
+          <h1 className="text-base font-bold text-white">🔍 ReTool</h1>
+        </div>
+        <div className="p-4 md:p-6">
+          {page === 'dashboard' && <Dashboard nav={nav} addToast={addToast} />}
+          {page === 'upload' && <UploadPage nav={nav} addToast={addToast} />}
+          {page === 'analysis' && analysisId && <AnalysisDetail id={analysisId} nav={nav} addToast={addToast} />}
+        </div>
+      </main>
+      <ToastContainer toasts={toasts} remove={removeToast} />
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
