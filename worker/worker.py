@@ -1,0 +1,1409 @@
+#!/usr/bin/env python3
+"""ReTool Analysis Worker — listens for tasks on shared volume, runs RE tools, returns results."""
+
+import os
+import sys
+import json
+import time
+import shutil
+import subprocess
+import tempfile
+import traceback
+from pathlib import Path
+
+DATA_DIR = Path("/data")
+INPUT_DIR = DATA_DIR / "input"
+OUTPUT_DIR = DATA_DIR / "output"
+SCRIPTS_DIR = Path("/opt/retool/scripts")
+
+# Add scripts dir to path for imports
+sys.path.insert(0, str(SCRIPTS_DIR))
+
+
+def run_cmd(cmd, timeout=120, cwd=None):
+    """Run shell command, return (stdout, stderr, returncode)."""
+    try:
+        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+        return proc.stdout, proc.stderr, proc.returncode
+    except subprocess.TimeoutExpired:
+        return "", f"Timeout after {timeout}s", -1
+    except Exception as e:
+        return "", str(e), -1
+
+
+def analyze_deb(filepath, output):
+    """Deep analysis of .deb package."""
+    result = {"package_info": {}, "dependencies": [], "files": [], "binaries": [],
+              "configs": [], "services": [], "scripts": {}, "description": ""}
+
+    with tempfile.TemporaryDirectory(prefix="retool_deb_") as tmpdir:
+        # Extract with ar
+        out, err, rc = run_cmd(f"ar x {filepath}", cwd=tmpdir)
+        if rc != 0:
+            result["error"] = f"ar extraction failed: {err}"
+            return result
+
+        print(f"  [deb] ar extracted: {os.listdir(tmpdir)}", flush=True)
+
+        # Helper to extract tar (handles .gz, .xz, .zst, .bz2)
+        def extract_tar(tar_path, dest_dir):
+            os.makedirs(dest_dir, exist_ok=True)
+            # Try with auto-detect first
+            out, err, rc = run_cmd(f"tar xf {tar_path} -C {dest_dir}", timeout=60)
+            if rc != 0:
+                # Fallback: try with explicit flags
+                if tar_path.endswith(".zst"):
+                    run_cmd(f"zstd -d {tar_path} -o {tar_path.replace('.zst', '')}", timeout=30)
+                    uncompressed = tar_path.replace(".zst", "")
+                    if os.path.exists(uncompressed):
+                        run_cmd(f"tar xf {uncompressed} -C {dest_dir}", timeout=60)
+                elif tar_path.endswith(".xz"):
+                    run_cmd(f"xz -d {tar_path}", timeout=30)
+                    uncompressed = tar_path.replace(".xz", "")
+                    if os.path.exists(uncompressed):
+                        run_cmd(f"tar xf {uncompressed} -C {dest_dir}", timeout=60)
+            return os.path.exists(dest_dir) and len(os.listdir(dest_dir)) > 0
+
+        # Parse control
+        for f in os.listdir(tmpdir):
+            if f.startswith("control.tar"):
+                control_dir = os.path.join(tmpdir, "control")
+                tar_path = os.path.join(tmpdir, f)
+                print(f"  [deb] Extracting control: {f}", flush=True)
+                extract_tar(tar_path, control_dir)
+
+                control_path = os.path.join(control_dir, "control")
+                if not os.path.exists(control_path):
+                    # Try in DEBIAN subdirectory
+                    control_path = os.path.join(control_dir, "DEBIAN", "control")
+                if os.path.exists(control_path):
+                    with open(control_path) as cf:
+                        current_key = None
+                        for line in cf:
+                            line = line.rstrip()
+                            if ":" in line and not line.startswith(" "):
+                                key, val = line.split(":", 1)
+                                key, val = key.strip(), val.strip()
+                                result["package_info"][key] = val
+                                current_key = key
+                            elif line.startswith(" ") and current_key:
+                                result["package_info"][current_key] += "\n" + line.strip()
+                    result["description"] = result["package_info"].get("Description", "")
+                    deps = result["package_info"].get("Depends", "")
+                    if deps:
+                        result["dependencies"] = [d.strip().split("(")[0].strip() for d in deps.split(",")]
+                    print(f"  [deb] Package: {result['package_info'].get('Package', '?')} v{result['package_info'].get('Version', '?')}", flush=True)
+
+                # Read install scripts
+                for script in ["preinst", "postinst", "prerm", "postrm"]:
+                    spath = os.path.join(control_dir, script)
+                    if not os.path.exists(spath):
+                        spath = os.path.join(control_dir, "DEBIAN", script)
+                    if os.path.exists(spath):
+                        with open(spath) as sf:
+                            result["scripts"][script] = sf.read(10000)
+
+        # Parse data
+        for f in os.listdir(tmpdir):
+            if f.startswith("data.tar"):
+                data_dir = os.path.join(tmpdir, "data")
+                tar_path = os.path.join(tmpdir, f)
+                print(f"  [deb] Extracting data: {f}", flush=True)
+                extract_tar(tar_path, data_dir)
+
+                for root, dirs, files in os.walk(data_dir):
+                    for fname in files:
+                        full_path = os.path.join(root, fname)
+                        rel_path = os.path.relpath(full_path, data_dir)
+                        fpath = "/" + rel_path
+                        try:
+                            fsize = os.path.getsize(full_path)
+                        except:
+                            fsize = 0
+
+                        finfo = {"path": fpath, "size": fsize}
+
+                        if "bin/" in rel_path or "sbin/" in rel_path:
+                            finfo["type"] = "binary"
+                            # Analyze binary
+                            file_out, _, _ = run_cmd(f"file {full_path}")
+                            finfo["file_info"] = file_out.strip()
+                            # Get strings
+                            strings_out, _, _ = run_cmd(f"strings -n 8 {full_path} | head -100")
+                            finfo["strings_sample"] = strings_out[:2000]
+                            result["binaries"].append(finfo)
+                        elif rel_path.endswith((".conf", ".cfg", ".ini", ".yaml", ".yml", ".toml")):
+                            finfo["type"] = "config"
+                            try:
+                                with open(full_path, "r", errors="ignore") as cf:
+                                    finfo["content_preview"] = cf.read(2000)
+                            except:
+                                pass
+                            result["configs"].append(finfo)
+                        elif ".service" in rel_path:
+                            finfo["type"] = "service"
+                            try:
+                                with open(full_path, "r", errors="ignore") as sf:
+                                    finfo["content"] = sf.read(2000)
+                            except:
+                                pass
+                            result["services"].append(finfo)
+                        elif rel_path.endswith((".so", ".so.1", ".so.2")):
+                            finfo["type"] = "library"
+
+                        result["files"].append(finfo)
+
+    return result
+
+
+def analyze_elf_deep(filepath, output):
+    """Deep ELF binary analysis."""
+    result = {"sections": [], "symbols": [], "imports": [], "strings_categorized": {},
+              "language": "unknown", "framework": "unknown", "crypto_detected": [],
+              "network_libs": [], "persistence_mechanisms": []}
+
+    # readelf headers
+    out, _, _ = run_cmd(f"readelf -h {filepath}")
+    result["header"] = out
+
+    # readelf sections
+    out, _, _ = run_cmd(f"readelf -S {filepath}")
+    result["sections_raw"] = out
+
+    # Symbols (if not stripped)
+    out, _, _ = run_cmd(f"nm -D {filepath} 2>/dev/null | head -200")
+    result["dynamic_symbols"] = out
+
+    # ldd (shared libraries)
+    out, _, _ = run_cmd(f"ldd {filepath} 2>/dev/null")
+    result["shared_libs"] = out
+
+    # Detect language
+    out, _, _ = run_cmd(f"strings -n 10 {filepath}")
+    all_strings = out
+
+    if "go.buildid" in all_strings or "runtime.go" in all_strings or "go.build" in all_strings:
+        result["language"] = "Go"
+        # Extract Go build info
+        out2, _, _ = run_cmd(f"strings {filepath} | grep -i 'go1\\.' | head -5")
+        result["go_version"] = out2.strip()
+    elif "rust_begin_unwind" in all_strings or "rust_panic" in all_strings or "/rustc/" in all_strings:
+        result["language"] = "Rust"
+    elif "libstdc++" in all_strings or "GLIBCXX" in all_strings:
+        result["language"] = "C++"
+    elif "libc.so" in all_strings:
+        result["language"] = "C"
+
+    # Detect frameworks
+    string_lower = all_strings.lower()
+    if "qt" in string_lower and ("qwidget" in string_lower or "qapplication" in string_lower):
+        result["framework"] = "Qt"
+    elif "gtk_" in string_lower or "gtkwidget" in string_lower:
+        result["framework"] = "GTK"
+    elif "electron" in string_lower:
+        result["framework"] = "Electron"
+    elif "libflutter" in string_lower or "flutter" in string_lower:
+        result["framework"] = "Flutter"
+    elif "react-native" in string_lower:
+        result["framework"] = "React Native"
+
+    # Detect crypto
+    for algo in ["aes", "rsa", "sha256", "sha512", "md5", "blowfish", "chacha20", "curve25519"]:
+        if algo in string_lower:
+            result["crypto_detected"].append(algo)
+
+    # Detect network libs
+    for lib in ["libcurl", "libssl", "libcrypto", "libwebsocket", "libsoup", "libhttp"]:
+        if lib in all_strings:
+            result["network_libs"].append(lib)
+
+    # Categorized strings
+    import re
+    urls = re.findall(r'https?://[^\s<>"\']+', all_strings)
+    ips = re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', all_strings)
+    emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', all_strings)
+    paths = re.findall(r'(?:/[a-zA-Z0-9._-]+){2,}', all_strings)
+
+    result["strings_categorized"] = {
+        "urls": list(set(urls))[:50],
+        "ips": list(set(ips))[:30],
+        "emails": list(set(emails))[:20],
+        "file_paths": list(set(paths))[:50],
+        "total_strings": len(all_strings.split("\n"))
+    }
+
+    # Disassemble key sections with objdump
+    out, _, _ = run_cmd(f"objdump -d {filepath} | head -500")
+    result["disassembly_sample"] = out[:5000]
+
+    # Check for persistence mechanisms
+    for keyword in ["crontab", "systemd", "/etc/init", "autostart", ".bashrc", ".profile", "LaunchAgent"]:
+        if keyword in all_strings:
+            result["persistence_mechanisms"].append(keyword)
+
+    return result
+
+
+def analyze_pe_deep(filepath, output):
+    """Deep PE binary analysis."""
+    result = {"imports": [], "exports": [], "sections": [], "resources": [],
+              "language": "unknown", "dotnet": False, "packed": False,
+              "installer_type": None, "strings_categorized": {}}
+
+    # Detect installer
+    out, _, _ = run_cmd(f"strings -n 5 {filepath} | head -200")
+    if "Nullsoft" in out or "NSIS" in out:
+        result["installer_type"] = "NSIS"
+    elif "Inno Setup" in out:
+        result["installer_type"] = "InnoSetup"
+    elif "InstallShield" in out:
+        result["installer_type"] = "InstallShield"
+    elif "WiX" in out or "Windows Installer" in out:
+        result["installer_type"] = "MSI"
+
+    # PE analysis with pefile
+    try:
+        import pefile
+        pe = pefile.PE(filepath)
+
+        # Imports
+        if hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
+            for entry in pe.DIRECTORY_ENTRY_IMPORT:
+                dll = entry.dll.decode(errors='ignore')
+                for imp in entry.imports:
+                    if imp.name:
+                        result["imports"].append({"dll": dll, "func": imp.name.decode(errors='ignore')})
+
+        # Exports
+        if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
+            for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+                if exp.name:
+                    result["exports"].append(exp.name.decode(errors='ignore'))
+
+        # Sections
+        for sec in pe.sections:
+            name = sec.Name.decode(errors='ignore').strip('\x00')
+            result["sections"].append({
+                "name": name,
+                "virtual_size": sec.Misc_VirtualSize,
+                "raw_size": sec.SizeOfRawData,
+                "entropy": sec.get_entropy()
+            })
+
+        # .NET detection
+        for entry in pe.OPTIONAL_HEADER.DATA_DIRECTORY:
+            if entry.name == "IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR" and entry.VirtualAddress:
+                result["dotnet"] = True
+                result["language"] = ".NET/C#"
+                break
+
+        # Packer detection (high entropy sections)
+        for sec in result["sections"]:
+            if sec["entropy"] > 7.0 and sec["raw_size"] > 1000:
+                result["packed"] = True
+                break
+
+        pe.close()
+    except Exception as e:
+        result["pe_error"] = str(e)
+
+    # All strings
+    out, _, _ = run_cmd(f"strings -n 8 {filepath}")
+    all_strings = out
+
+    # Language detection
+    if result.get("dotnet"):
+        result["language"] = ".NET/C#"
+    elif "vcruntime" in all_strings.lower() or "msvcp" in all_strings.lower():
+        result["language"] = "C++ (MSVC)"
+    elif "mingw" in all_strings.lower():
+        result["language"] = "C/C++ (MinGW)"
+    elif "pyinstaller" in all_strings.lower():
+        result["language"] = "Python (PyInstaller)"
+    elif "electron" in all_strings.lower():
+        result["language"] = "JavaScript (Electron)"
+    elif "qt" in all_strings.lower():
+        result["language"] = "C++ (Qt)"
+
+    # Categorized strings
+    import re
+    urls = re.findall(r'https?://[^\s<>"\']+', all_strings)
+    ips = re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', all_strings)
+    regs = re.findall(r'HKEY_[A-Z_]+\\[^\s]+', all_strings)
+    emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', all_strings)
+
+    result["strings_categorized"] = {
+        "urls": list(set(urls))[:50],
+        "ips": list(set(ips))[:30],
+        "registry_keys": list(set(regs))[:20],
+        "emails": list(set(emails))[:20],
+        "total_strings": len(all_strings.split("\n"))
+    }
+
+    return result
+
+
+def analyze_apk_deep(filepath, output):
+    """Deep APK analysis with jadx + apktool."""
+    result = {"manifest": {}, "permissions": [], "activities": [], "services": [],
+              "receivers": [], "providers": [], "decompiled": False, "source_code": {}}
+
+    with tempfile.TemporaryDirectory(prefix="retool_apk_") as tmpdir:
+        # Decode with apktool
+        apktool_dir = os.path.join(tmpdir, "apktool_out")
+        out, err, rc = run_cmd(f"apktool d -f -s {filepath} -o {apktool_dir}", timeout=120)
+        if rc == 0:
+            result["decompiled"] = True
+
+            # Parse AndroidManifest.xml
+            manifest_path = os.path.join(apktool_dir, "AndroidManifest.xml")
+            if os.path.exists(manifest_path):
+                with open(manifest_path, "r", errors="ignore") as mf:
+                    manifest_content = mf.read()
+                result["manifest"]["raw"] = manifest_content[:5000]
+
+                # Extract permissions
+                import re
+                perms = re.findall(r'android\.permission\.(\w+)', manifest_content)
+                result["permissions"] = list(set(perms))
+
+                # Extract components
+                activities = re.findall(r'<activity[^>]*android:name="([^"]*)"', manifest_content)
+                result["activities"] = activities
+                services = re.findall(r'<service[^>]*android:name="([^"]*)"', manifest_content)
+                result["services"] = services
+                receivers = re.findall(r'<receiver[^>]*android:name="([^"]*)"', manifest_content)
+                result["receivers"] = receivers
+
+        # Decompile with jadx
+        jadx_dir = os.path.join(tmpdir, "jadx_out")
+        out, err, rc = run_cmd(f"jadx -d {jadx_dir} {filepath}", timeout=180)
+        if rc == 0:
+            # Collect key Java files
+            key_files = []
+            for root, dirs, files in os.walk(jadx_dir):
+                for fname in files:
+                    if fname.endswith(".java"):
+                        full_path = os.path.join(root, fname)
+                        rel = os.path.relpath(full_path, jadx_dir)
+                        try:
+                            with open(full_path, "r", errors="ignore") as jf:
+                                content = jf.read()
+                            # Only keep interesting files (API clients, main activities, etc.)
+                            if any(kw in content.lower() for kw in ["http", "api", "retrofit", "okhttp",
+                                                                     "firebase", "network", "login", "auth",
+                                                                     "encrypt", "decrypt", "database", "sqlite"]):
+                                key_files.append({"path": rel, "content": content[:5000]})
+                        except:
+                            pass
+            result["source_code"]["key_files"] = key_files[:30]
+
+            # Count total files
+            total_java = sum(1 for _, _, f in os.walk(jadx_dir) for fn in f if fn.endswith(".java"))
+            result["source_code"]["total_java_files"] = total_java
+
+    return result
+
+
+def analyze_dotnet_deep(filepath, output):
+    """Deep .NET analysis with ILSpy decompilation → C# source code."""
+    result = {"decompiled": False, "namespaces": [], "classes": [], "source_files": [],
+              "resources": [], "dotnet_info": {}, "error": None}
+
+    # Get .NET metadata with pefile
+    try:
+        import pefile
+        pe = pefile.PE(filepath)
+        if hasattr(pe, 'DIRECTORY_ENTRY_COMIMAGE'):
+            clr = pe.DIRECTORY_ENTRY_COMIMAGE.struct
+            result["dotnet_info"] = {
+                "runtime_version": f"{clr.MajorRuntimeVersion}.{clr.MinorRuntimeVersion}",
+                "flags": clr.Flags,
+                "entry_point": hex(clr.EntryPointRVA) if clr.EntryPointRVA else None,
+            }
+        pe.close()
+    except Exception as e:
+        result["dotnet_info_error"] = str(e)
+
+    with tempfile.TemporaryDirectory(prefix="retool_dotnet_") as tmpdir:
+        out_dir = os.path.join(tmpdir, "decompiled")
+        os.makedirs(out_dir, exist_ok=True)
+
+        # Decompile with ILSpy
+        print(f"  [dotnet] Decompiling with ILSpy...", flush=True)
+        out, err, rc = run_cmd(
+            f"ilspycmd -p -o {out_dir} {filepath}",
+            timeout=300
+        )
+
+        if rc != 0:
+            # Try with just types (no resources)
+            out, err, rc = run_cmd(
+                f"ilspycmd -t -o {out_dir} {filepath}",
+                timeout=300
+            )
+
+        if rc == 0:
+            result["decompiled"] = True
+
+            # Collect all .cs files
+            cs_files = []
+            namespaces = set()
+            classes = []
+
+            for root, dirs, files in os.walk(out_dir):
+                for fname in files:
+                    full_path = os.path.join(root, fname)
+                    rel_path = os.path.relpath(full_path, out_dir)
+
+                    if fname.endswith(".cs"):
+                        try:
+                            with open(full_path, "r", errors="ignore") as f:
+                                content = f.read()
+
+                            # Extract namespace and class names
+                            import re
+                            ns_match = re.findall(r'namespace\s+([\w.]+)', content)
+                            cls_match = re.findall(r'(?:public|internal|private|protected)?\s*(?:static\s+)?(?:partial\s+)?(?:class|struct|interface|enum)\s+(\w+)', content)
+
+                            for ns in ns_match:
+                                namespaces.add(ns)
+                            for cls in cls_match:
+                                classes.append({"name": cls, "namespace": ns_match[0] if ns_match else "", "file": rel_path})
+
+                            cs_files.append({
+                                "path": rel_path,
+                                "content": content[:15000],  # Keep substantial code
+                                "size": len(content),
+                                "lines": content.count("\n")
+                            })
+                        except:
+                            pass
+
+            # Sort by importance: main/program files first, then by size
+            def file_priority(f):
+                name = f["path"].lower()
+                if "program" in name or "main" in name or "entry" in name:
+                    return 0
+                if "app" in name or "config" in name or "settings" in name:
+                    return 1
+                if "api" in name or "client" in name or "network" in name or "http" in name:
+                    return 2
+                if "auth" in name or "login" in name or "encrypt" in name:
+                    return 3
+                return 4
+
+            cs_files.sort(key=lambda x: (file_priority(x), -x["size"]))
+            result["source_files"] = cs_files[:100]  # Top 100 files
+            result["namespaces"] = sorted(namespaces)
+            result["classes"] = classes[:200]
+            result["total_cs_files"] = len(cs_files)
+            result["total_lines"] = sum(f["lines"] for f in cs_files)
+
+            print(f"  [dotnet] Decompiled {len(cs_files)} .cs files, {result['total_lines']} lines", flush=True)
+        else:
+            result["error"] = f"ILSpy failed: {err[:500]}" if err else "Unknown error"
+            print(f"  [dotnet] ILSpy failed: {err[:200]}", flush=True)
+
+    return result
+
+
+def run_ghidra_decompile(filepath, output):
+    """Run Ghidra headless analysis — function tracing, call graph, decompilation."""
+    result = {"functions": [], "decompiled": [], "call_graph": {},
+              "interesting_functions": {}, "entry_point": None, "total_functions": 0,
+              "import_table": [], "export_table": [], "error": None}
+
+    with tempfile.TemporaryDirectory(prefix="retool_ghidra_") as tmpdir:
+        project_dir = os.path.join(tmpdir, "project")
+        output_dir = os.path.join(tmpdir, "output")
+        os.makedirs(project_dir, exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
+
+        fname = os.path.basename(filepath)
+        shutil.copy2(filepath, os.path.join(tmpdir, fname))
+
+        # Enhanced Ghidra script — traces calls, identifies interesting funcs
+        ghidra_script = r"""
+import ghidra.app.decompiler as Decomp
+from ghidra.program.model.listing import Function
+from ghidra.program.model.symbol import SymbolType, SourceType
+from ghidra.program.model.address import AddressSet
+import json
+
+program = getCurrentProgram()
+decomp = Decomp.DecompInterface()
+decomp.openProgram(program)
+fm = program.getFunctionManager()
+listing = program.getListing()
+memory = program.getMemory()
+
+# === Entry point ===
+entry = program.getSymbolTable().getExternalEntryPoint()
+entry_addr = str(program.getEntryPoint()) if program.getEntryPoint() else None
+
+# === Interesting function keywords ===
+CRYPTO_KEYWORDS = ["aes", "des", "rsa", "sha", "md5", "encrypt", "decrypt", "cipher",
+                   "hash", "hmac", "crypto", "rc4", "blowfish", "chacha", "xor"]
+NETWORK_KEYWORDS = ["socket", "connect", "send", "recv", "http", "url", "dns",
+                    "curl", "wget", "wininet", "winhttp", "inet", "ftp", "smtp",
+                    "urlopen", "requests", "bind", "listen", "accept"]
+FILE_KEYWORDS = ["createfile", "writefile", "readfile", "deletefile", "movefile",
+                 "copyfile", "openfile", "findfirst", "findnext", "fopen", "fwrite",
+                 "fread", "mkdir", "rmdir", "unlink", "rename"]
+REGISTRY_KEYWORDS = ["regopen", "regset", "regquery", "regcreate", "regdelete",
+                     "regclose"]
+PROCESS_KEYWORDS = ["createprocess", "shellexecute", "virtualalloc", "virtualprotect",
+                    "loadlibrary", "getprocaddress", "writeprocessmemory",
+                    "createremotethread", "ntwritevirtualmemory", "mmap", "mprotect",
+                    "dlopen", "dlsym"]
+ANTI_DEBUG_KEYWORDS = ["isdebuggerpresent", "checkremotedebuggerpresent",
+                       "ntqueryinformationprocess", "ptrace", "debugbreak",
+                       "outputdebugstring"]
+
+all_funcs = []
+interesting = {"crypto": [], "network": [], "file_io": [], "registry": [],
+               "process_injection": [], "anti_debug": [], "entry_functions": []}
+call_graph = {}
+
+# === Iterate all functions ===
+for func in fm.getFunctions(True):
+    if func.isThunk():
+        continue
+    name = func.getName()
+    name_lower = name.lower()
+    addr = str(func.getEntryPoint())
+    size = func.getBody().getNumAddresses()
+    is_external = func.isExternal()
+    calling_conv = str(func.getCallingConventionName()) if func.getCallingConventionName() else "unknown"
+
+    # Get called functions (callees)
+    callees = []
+    ref_mgr = program.getReferenceManager()
+    body = func.getBody()
+    for ref_addr in body:
+        refs = ref_mgr.getReferencesFrom(ref_addr)
+        for ref in refs:
+            if ref.getReferenceType().isCall():
+                callee_addr = ref.getToAddress()
+                callee_sym = program.getSymbolTable().getPrimarySymbol(callee_addr)
+                if callee_sym:
+                    callees.append(str(callee_sym))
+
+    func_info = {
+        "name": name,
+        "address": addr,
+        "size": size,
+        "external": is_external,
+        "calling_conv": calling_conv,
+        "callees": list(set(callees))[:20]
+    }
+
+    all_funcs.append(func_info)
+    call_graph[name] = list(set(callees))[:20]
+
+    # Categorize interesting functions
+    for kw in CRYPTO_KEYWORDS:
+        if kw in name_lower:
+            interesting["crypto"].append(func_info)
+            break
+    for kw in NETWORK_KEYWORDS:
+        if kw in name_lower:
+            interesting["network"].append(func_info)
+            break
+    for kw in FILE_KEYWORDS:
+        if kw in name_lower:
+            interesting["file_io"].append(func_info)
+            break
+    for kw in REGISTRY_KEYWORDS:
+        if kw in name_lower:
+            interesting["registry"].append(func_info)
+            break
+    for kw in PROCESS_KEYWORDS:
+        if kw in name_lower:
+            interesting["process_injection"].append(func_info)
+            break
+    for kw in ANTI_DEBUG_KEYWORDS:
+        if kw in name_lower:
+            interesting["anti_debug"].append(func_info)
+            break
+
+# === Decompile TOP functions (biggest + entry + interesting) ===
+decompile_targets = set()
+
+# Entry point function
+entry_func = fm.getFunctionAt(program.getEntryPoint())
+if entry_func:
+    decompile_targets.add(entry_func.getEntryPoint())
+
+# Top 30 biggest functions
+sorted_by_size = sorted(all_funcs, key=lambda x: x["size"], reverse=True)
+for f in sorted_by_size[:30]:
+    from ghidra.program.model.address import Address
+    addr_obj = program.getAddressFactory().getAddress(f["address"])
+    if addr_obj:
+        func_obj = fm.getFunctionAt(addr_obj)
+        if func_obj:
+            decompile_targets.add(func_obj.getEntryPoint())
+
+# All interesting functions
+for cat in interesting.values():
+    for f in cat:
+        addr_obj = program.getAddressFactory().getAddress(f["address"])
+        if addr_obj:
+            func_obj = fm.getFunctionAt(addr_obj)
+            if func_obj:
+                decompile_targets.add(func_obj.getEntryPoint())
+
+# Decompile selected functions
+decompiled = []
+for addr in decompile_targets:
+    func = fm.getFunctionAt(addr)
+    if not func:
+        continue
+    result = decomp.decompileFunction(func, 30, monitor)
+    c_code = ""
+    if result and result.decompileCompleted():
+        c_code = result.getDecompiledFunction().getC()
+
+    decompiled.append({
+        "name": func.getName(),
+        "address": str(func.getEntryPoint()),
+        "size": func.getBody().getNumAddresses(),
+        "code": c_code[:8000] if c_code else "",
+        "calling_conv": str(func.getCallingConventionName()) if func.getCallingConventionName() else "unknown"
+    })
+
+# === Import/Export tables ===
+imports = []
+exports = []
+for sym in program.getSymbolTable().getAllSymbols(True):
+    if sym.isExternal():
+        imports.append(str(sym))
+    elif sym.getSource() == SourceType.DEFAULT and sym.getName() and not sym.getName().startswith("FUN_"):
+        pass  # Skip default labels
+
+for sym in program.getSymbolTable().getExternalSymbols():
+    imports.append(str(sym))
+
+# Save all results
+final = {
+    "total_functions": len(all_funcs),
+    "entry_point": entry_addr,
+    "functions": all_funcs[:500],
+    "decompiled": decompiled,
+    "call_graph": call_graph,
+    "interesting": {k: v for k, v in interesting.items() if v},
+    "imports": imports[:200],
+    "exports": exports[:100]
+}
+
+with open(output_dir + "/ghidra_results.json", "w") as f:
+    json.dump(final, f, default=str)
+
+print("[Ghidra] Done: %d functions, %d decompiled, %d interesting" % (
+    len(all_funcs), len(decompiled), sum(len(v) for v in interesting.values())), flush=True)
+"""
+        script_path = os.path.join(tmpdir, "analyze.py")
+        with open(script_path, "w") as f:
+            f.write(ghidra_script)
+
+        cmd = (f"analyzeHeadless {project_dir} ReToolProject "
+               f"-import {os.path.join(tmpdir, fname)} "
+               f"-postScript {script_path} "
+               f"-scriptPath {tmpdir} "
+               f"-deleteProject")
+
+        print(f"  [ghidra] Running analyzeHeadless on {fname}...", flush=True)
+        out, err, rc = run_cmd(cmd, timeout=600)
+
+        ghidra_json = os.path.join(output_dir, "ghidra_results.json")
+        if os.path.exists(ghidra_json):
+            with open(ghidra_json) as f:
+                data = json.load(f)
+            result["functions"] = data.get("functions", [])
+            result["decompiled"] = data.get("decompiled", [])
+            result["call_graph"] = data.get("call_graph", {})
+            result["interesting_functions"] = data.get("interesting", {})
+            result["entry_point"] = data.get("entry_point")
+            result["total_functions"] = data.get("total_functions", 0)
+            result["import_table"] = data.get("imports", [])
+            result["export_table"] = data.get("exports", [])
+
+            total = result["total_functions"]
+            decompiled_count = len(result["decompiled"])
+            interesting_count = sum(len(v) for v in result["interesting_functions"].values())
+            print(f"  [ghidra] Done: {total} functions, {decompiled_count} decompiled, {interesting_count} interesting", flush=True)
+        else:
+            result["error"] = f"Ghidra failed: {err[:500]}" if err else "No output"
+            print(f"  [ghidra] FAILED: {err[:200]}", flush=True)
+
+    return result
+
+
+def run_dynamic_analysis(filepath, output):
+    """Run dynamic analysis — strace + Wine (for PE) + network capture + filesystem monitoring."""
+    result = {"syscalls": {}, "file_ops": [], "network_ops": [], "process_tree": [],
+              "captured_strings": [], "stdout": "", "stderr": "", "error": None,
+              "wine_output": None, "network_capture": None}
+
+    with tempfile.TemporaryDirectory(prefix="retool_dyn_") as tmpdir:
+        fname = os.path.basename(filepath)
+        work_file = os.path.join(tmpdir, fname)
+        shutil.copy2(filepath, work_file)
+        os.chmod(work_file, 0o755)
+
+        # Detect if it's a PE (Windows) or ELF (Linux)
+        with open(filepath, "rb") as f:
+            magic_bytes = f.read(4)
+        is_pe = magic_bytes[:2] == b"MZ"
+
+        import re
+        from collections import Counter
+
+        # === Start network capture in background ===
+        pcap_file = os.path.join(tmpdir, "capture.pcap")
+        tcpdump_proc = subprocess.Popen(
+            ["tcpdump", "-i", "any", "-w", pcap_file, "-c", "1000"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+
+        # === Snapshot filesystem for diff ===
+        snapshot_dirs = ["/tmp", "/var/tmp"]
+        fs_before = {}
+        for d in snapshot_dirs:
+            if os.path.exists(d):
+                for root, dirs, files in os.walk(d):
+                    for f in files:
+                        fp = os.path.join(root, f)
+                        try:
+                            fs_before[fp] = os.path.getmtime(fp)
+                        except:
+                            pass
+
+        if is_pe:
+            # === Windows PE → Run with Wine under strace ===
+            print(f"  [dynamic] Running PE with Wine + strace...", flush=True)
+            strace_out = os.path.join(tmpdir, "strace.txt")
+            stdout_out = os.path.join(tmpdir, "stdout.txt")
+            stderr_out = os.path.join(tmpdir, "stderr.txt")
+
+            # Set up Wine prefix
+            wine_prefix = os.path.join(tmpdir, "wineprefix")
+            env = f"WINEPREFIX={wine_prefix} WINEDEBUG=-all DISPLAY=:99"
+
+            # Run with Wine under strace
+            run_cmd(f"{env} timeout 20 strace -f -o {strace_out} wine '{work_file}' > {stdout_out} 2> {stderr_out}", timeout=30)
+
+            # Also try direct Wine for output capture
+            wine_out, wine_err, wine_rc = run_cmd(f"{env} timeout 15 wine '{work_file}'", timeout=20)
+            result["wine_output"] = {"stdout": wine_out[:5000], "stderr": wine_err[:5000], "rc": wine_rc}
+
+            # Collect Wine-created files
+            wine_files = []
+            if os.path.exists(wine_prefix):
+                for root, dirs, files in os.walk(wine_prefix):
+                    for f in files:
+                        fp = os.path.join(root, f)
+                        try:
+                            size = os.path.getsize(fp)
+                            if size > 0:
+                                wine_files.append({"path": fp, "size": size})
+                        except:
+                            pass
+            result["wine_files_created"] = len(wine_files)
+
+            # Read strace
+            if os.path.exists(strace_out):
+                with open(strace_out, "r", errors="ignore") as f:
+                    strace_data = f.read(500000)
+
+                syscall_pattern = re.compile(r'^(\w+)\(')
+                syscall_counts = Counter()
+                for line in strace_data.split("\n"):
+                    m = syscall_pattern.search(line)
+                    if m:
+                        syscall_counts[m.group(1)] += 1
+                result["syscalls"] = dict(syscall_counts.most_common(30))
+
+                for line in strace_data.split("\n"):
+                    if any(op in line for op in ["open(", "openat(", "unlink(", "rename("]):
+                        result["file_ops"].append(line[:200])
+                    if any(op in line for op in ["connect(", "sendto(", "recvfrom(", "socket("]):
+                        result["network_ops"].append(line[:200])
+                result["file_ops"] = result["file_ops"][:50]
+                result["network_ops"] = result["network_ops"][:30]
+
+            # Read stdout/stderr
+            if os.path.exists(stdout_out):
+                with open(stdout_out, "r", errors="ignore") as f:
+                    result["stdout"] = f.read(5000)
+            if os.path.exists(stderr_out):
+                with open(stderr_out, "r", errors="ignore") as f:
+                    result["stderr"] = f.read(5000)
+
+        else:
+            # === Native ELF → Run with strace ===
+            print(f"  [dynamic] Running ELF with strace...", flush=True)
+            strace_out = os.path.join(tmpdir, "strace.txt")
+            run_cmd(f"timeout 15 strace -f -o {strace_out} {work_file}", timeout=20)
+
+            if os.path.exists(strace_out):
+                with open(strace_out, "r", errors="ignore") as f:
+                    strace_data = f.read(500000)
+
+                syscall_pattern = re.compile(r'^(\w+)\(')
+                syscall_counts = Counter()
+                for line in strace_data.split("\n"):
+                    m = syscall_pattern.search(line)
+                    if m:
+                        syscall_counts[m.group(1)] += 1
+                result["syscalls"] = dict(syscall_counts.most_common(30))
+
+                for line in strace_data.split("\n"):
+                    if any(op in line for op in ["open(", "openat(", "unlink(", "rename("]):
+                        result["file_ops"].append(line[:200])
+                    if any(op in line for op in ["connect(", "sendto(", "recvfrom(", "socket("]):
+                        result["network_ops"].append(line[:200])
+                result["file_ops"] = result["file_ops"][:50]
+                result["network_ops"] = result["network_ops"][:30]
+
+            # stdout/stderr
+            stdout_out = os.path.join(tmpdir, "stdout.txt")
+            stderr_out = os.path.join(tmpdir, "stderr.txt")
+            run_cmd(f"timeout 10 {work_file} > {stdout_out} 2> {stderr_out}", timeout=15)
+
+            if os.path.exists(stdout_out):
+                with open(stdout_out, "r", errors="ignore") as f:
+                    result["stdout"] = f.read(5000)
+            if os.path.exists(stderr_out):
+                with open(stderr_out, "r", errors="ignore") as f:
+                    result["stderr"] = f.read(5000)
+
+        # === Stop network capture ===
+        tcpdump_proc.terminate()
+        tcpdump_proc.wait(timeout=5)
+
+        # Parse pcap summary
+        if os.path.exists(pcap_file) and os.path.getsize(pcap_file) > 0:
+            out, _, rc = run_cmd(f"tcpdump -r {pcap_file} -nn 2>/dev/null | head -50")
+            result["network_capture"] = {
+                "pcap_size": os.path.getsize(pcap_file),
+                "summary": out[:3000]
+            }
+
+        # === Check filesystem changes ===
+        fs_changes = []
+        for d in snapshot_dirs:
+            if os.path.exists(d):
+                for root, dirs, files in os.walk(d):
+                    for f in files:
+                        fp = os.path.join(root, f)
+                        try:
+                            mtime = os.path.getmtime(fp)
+                            if fp not in fs_before or fs_before[fp] != mtime:
+                                fs_changes.append(fp)
+                        except:
+                            pass
+        result["filesystem_changes"] = fs_changes[:20]
+
+    return result
+
+
+def process_task(task_file):
+    """Process a single analysis task — with auto-extraction and recursive analysis."""
+    with open(task_file) as f:
+        task = json.load(f)
+
+    analysis_id = task["id"]
+    filepath = task["filepath"]
+    profile = task.get("profile", "quick_scan")
+    file_type = task.get("file_type", "Unknown")
+
+    output = {"id": analysis_id, "results": {}, "errors": [], "extraction": None, "children": []}
+
+    try:
+        # ============================================================
+        # PHASE 0: Archive handling — extract and find real payload
+        # ============================================================
+        if file_type in ("ZIP", "RAR", "7z", "TAR", "TGZ", "TBZ2", "TXZ", "GZ", "BZ2", "XZ"):
+            print(f"  [task] Archive detected ({file_type}) — extracting...", flush=True)
+            archive_result = handle_archive(filepath, str(OUTPUT_DIR / analysis_id))
+            output["extraction"] = archive_result
+
+            # Analyze extracted executables
+            execs = archive_result.get("executables", [])
+            if execs:
+                print(f"  [task] Found {len(execs)} executables in archive", flush=True)
+                for i, exe_path in enumerate(execs[:10]):
+                    try:
+                        child = analyze_extracted_file(exe_path, i)
+                        if child:
+                            output["children"].append(child)
+                    except Exception as e:
+                        print(f"  [task] Error analyzing {exe_path}: {e}", flush=True)
+
+            output["status"] = "completed"
+
+        # ============================================================
+        # PHASE 1: Auto-detect + Extract (always, for all PE files)
+        # ============================================================
+        elif file_type in ("PE", "DLL"):
+            from extractor import auto_extract
+            extract_result = auto_extract(filepath, str(OUTPUT_DIR / analysis_id))
+            output["extraction"] = {
+                "detection": extract_result["detection"],
+                "method": extract_result.get("extraction_method"),
+                "total_extracted": extract_result.get("total_extracted", 0),
+                "total_interesting": extract_result.get("total_interesting", 0),
+            }
+
+            # ============================================================
+            # PHASE 2: Analyze extracted payload (recursive)
+            # ============================================================
+            interesting = extract_result.get("interesting_files", [])
+            if interesting:
+                print(f"  [task] Analyzing {len(interesting)} extracted files...", flush=True)
+                # Sort by importance: executables first, then DLLs, then configs
+                def file_importance(fp):
+                    ext = os.path.splitext(fp)[1].lower()
+                    if ext in ('.exe', '.dll', '.sys', '.msi'): return 0
+                    if ext in ('.so', '.dylib', '.elf'): return 1
+                    if ext in ('.jar', '.class', '.py', '.bat', '.cmd', '.ps1'): return 2
+                    if ext in ('.config', '.xml', '.json', '.ini'): return 3
+                    return 4
+
+                interesting.sort(key=file_importance)
+
+                for i, ext_file in enumerate(interesting[:20]):  # Max 20 files
+                    try:
+                        child = analyze_extracted_file(ext_file, i)
+                        if child:
+                            output["children"].append(child)
+                    except Exception as e:
+                        print(f"  [task] Error analyzing {ext_file}: {e}", flush=True)
+
+                print(f"  [task] Analyzed {len(output['children'])} extracted files", flush=True)
+
+            # If extraction found interesting content, update the detection
+            if extract_result["detection"].get("sub_type") in ("dotnet",):
+                file_type = ".NET"
+
+            # Installer simulation — try to install with Wine
+            if extract_result["detection"].get("sub_type") in ("nsis", "inno", "installshield", "msi"):
+                print(f"  [task] Installer detected — simulating installation...", flush=True)
+                install_result = simulate_installer(filepath, str(OUTPUT_DIR / analysis_id))
+                output["extraction"]["installer_simulation"] = install_result
+
+        # ============================================================
+        # PHASE 3: Main file analysis
+        # ============================================================
+        if file_type in ("DEB",):
+            output["results"]["package"] = analyze_deb(filepath, output)
+        elif file_type in ("ELF", "SO", "Executable"):
+            output["results"]["binary"] = analyze_elf_deep(filepath, output)
+        elif file_type in ("PE", "DLL", ".NET"):
+            output["results"]["binary"] = analyze_pe_deep(filepath, output)
+            # .NET files always get ILSpy decompilation
+            pe_result = output["results"]["binary"]
+            if pe_result.get("dotnet"):
+                print(f"  [task] .NET detected — running ILSpy decompilation", flush=True)
+                output["results"]["dotnet"] = analyze_dotnet_deep(filepath, output)
+        elif file_type in ("APK",):
+            output["results"]["apk"] = analyze_apk_deep(filepath, output)
+
+        # Ghidra decompile — always for native binaries (skip .NET → ILSpy)
+        if file_type in ("ELF", "PE", "SO", "DLL", "Executable"):
+            if not output["results"].get("binary", {}).get("dotnet"):
+                print(f"  [task] Running Ghidra headless analysis...", flush=True)
+                output["results"]["ghidra"] = run_ghidra_decompile(filepath, output)
+
+        # ============================================================
+        # PHASE 4: Dynamic analysis — run with full monitoring
+        # ============================================================
+        if file_type in ("PE", "ELF", "SO", "Executable", "DLL"):
+            print(f"  [task] Running dynamic analysis...", flush=True)
+            output["results"]["dynamic"] = run_dynamic_analysis(filepath, output)
+
+        # ============================================================
+        # PHASE 5: Also analyze unpacked file if UPX was used
+        # ============================================================
+        if output.get("extraction", {}).get("method") == "unpack":
+            extract_dir = str(OUTPUT_DIR / analysis_id / "extracted")
+            unpacked = [f for f in os.listdir(extract_dir) if f.endswith(".unpacked")] if os.path.exists(extract_dir) else []
+            if unpacked:
+                unpacked_path = os.path.join(extract_dir, unpacked[0])
+                print(f"  [task] Analyzing unpacked binary: {unpacked[0]}", flush=True)
+                output["results"]["unpacked_binary"] = analyze_pe_deep(unpacked_path, output) if file_type in ("PE", "DLL") else analyze_elf_deep(unpacked_path, output)
+
+        output["status"] = "completed"
+    except Exception as e:
+        output["status"] = "failed"
+        output["errors"].append(str(e))
+        traceback.print_exc()
+
+    # Write result
+    result_file = OUTPUT_DIR / f"{analysis_id}.json"
+    with open(result_file, "w") as f:
+        json.dump(output, f, default=str)
+
+    # Remove task file
+    os.remove(task_file)
+
+    return output
+
+
+def handle_archive(filepath, output_dir):
+    """Extract archive and find executables inside.
+    Handles: ZIP, RAR, 7z, TAR, TAR.GZ, TAR.BZ2, TAR.XZ, GZ, BZ2, XZ
+    """
+    result = {"method": "archive", "total_extracted": 0, "executables": [],
+              "all_files": [], "error": None}
+
+    extract_dir = os.path.join(output_dir, "extracted")
+    os.makedirs(extract_dir, exist_ok=True)
+
+    fname = os.path.basename(filepath).lower()
+
+    # Determine archive type and extract
+    extracted = []
+
+    if fname.endswith((".zip", ".apk", ".jar", ".ipa", ".war", ".ear")) or filepath.lower().endswith(".zip"):
+        # ZIP-based: try 7z first (handles encoding issues better), fallback to Python zipfile
+        extracted_7z = False
+        out, err, rc = run_cmd(f"7z x -y -o'{extract_dir}' '{filepath}'", timeout=300)
+        if rc == 0:
+            for root, dirs, files in os.walk(extract_dir):
+                for f in files:
+                    extracted.append(os.path.join(root, f))
+            extracted_7z = True
+            print(f"  [archive] ZIP (7z) extracted {len(extracted)} files", flush=True)
+        else:
+            # Fallback: Python zipfile with per-file error handling
+            try:
+                import zipfile
+                with zipfile.ZipFile(filepath, 'r') as zf:
+                    for info in zf.infolist():
+                        try:
+                            zf.extract(info, extract_dir)
+                        except Exception:
+                            # Try extracting with corrected filename
+                            try:
+                                data = zf.read(info.filename)
+                                out_path = os.path.join(extract_dir, info.filename)
+                                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                                with open(out_path, 'wb') as fout:
+                                    fout.write(data)
+                            except Exception:
+                                pass
+                for root, dirs, files in os.walk(extract_dir):
+                    for f in files:
+                        extracted.append(os.path.join(root, f))
+                print(f"  [archive] ZIP (python) extracted {len(extracted)} files", flush=True)
+            except Exception as e:
+                result["error"] = f"ZIP extraction failed: {e}"
+
+    elif fname.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tar.xz", ".tar")):
+        # TAR-based
+        out, err, rc = run_cmd(f"tar xf '{filepath}' -C '{extract_dir}'", timeout=120)
+        if rc == 0:
+            for root, dirs, files in os.walk(extract_dir):
+                for f in files:
+                    extracted.append(os.path.join(root, f))
+            print(f"  [archive] TAR extracted {len(extracted)} files", flush=True)
+        else:
+            result["error"] = f"TAR extraction failed: {err[:200]}"
+
+    elif fname.endswith(".gz") and not fname.endswith(".tar.gz"):
+        # Single GZ file
+        out_name = filepath.rstrip(".gz").rstrip(".GZ")
+        out, err, rc = run_cmd(f"gunzip -c '{filepath}' > '{extract_dir}/{os.path.basename(out_name)}'", timeout=60)
+        if rc == 0:
+            extracted = [f"{extract_dir}/{os.path.basename(out_name)}"]
+
+    elif fname.endswith(".bz2"):
+        out_name = filepath.rstrip(".bz2").rstrip(".BZ2")
+        out, err, rc = run_cmd(f"bunzip2 -c '{filepath}' > '{extract_dir}/{os.path.basename(out_name)}'", timeout=60)
+        if rc == 0:
+            extracted = [f"{extract_dir}/{os.path.basename(out_name)}"]
+
+    elif fname.endswith(".xz"):
+        out_name = filepath.rstrip(".xz").rstrip(".XZ")
+        out, err, rc = run_cmd(f"xz -dc '{filepath}' > '{extract_dir}/{os.path.basename(out_name)}'", timeout=60)
+        if rc == 0:
+            extracted = [f"{extract_dir}/{os.path.basename(out_name)}"]
+
+    elif fname.endswith(".rar"):
+        # RAR
+        out, err, rc = run_cmd(f"7z x -y -o'{extract_dir}' '{filepath}'", timeout=120)
+        if rc == 0:
+            for root, dirs, files in os.walk(extract_dir):
+                for f in files:
+                    extracted.append(os.path.join(root, f))
+            print(f"  [archive] RAR extracted {len(extracted)} files", flush=True)
+        else:
+            result["error"] = f"RAR extraction failed: {err[:200]}"
+
+    elif fname.endswith(".7z"):
+        # 7z
+        out, err, rc = run_cmd(f"7z x -y -o'{extract_dir}' '{filepath}'", timeout=120)
+        if rc == 0:
+            for root, dirs, files in os.walk(extract_dir):
+                for f in files:
+                    extracted.append(os.path.join(root, f))
+            print(f"  [archive] 7z extracted {len(extracted)} files", flush=True)
+        else:
+            result["error"] = f"7z extraction failed: {err[:200]}"
+
+    else:
+        # Generic: try 7z
+        out, err, rc = run_cmd(f"7z x -y -o'{extract_dir}' '{filepath}'", timeout=120)
+        if rc == 0:
+            for root, dirs, files in os.walk(extract_dir):
+                for f in files:
+                    extracted.append(os.path.join(root, f))
+
+    # Filter out directories, keep only files
+    extracted = [f for f in extracted if os.path.isfile(f)]
+    result["total_extracted"] = len(extracted)
+    result["all_files"] = [{"name": os.path.basename(f), "size": os.path.getsize(f)} for f in extracted[:100]]
+
+    # Find executables
+    exe_extensions = {'.exe', '.dll', '.sys', '.msi', '.bat', '.cmd', '.ps1', '.vbs', '.js',
+                      '.apk', '.jar', '.elf', '.so', '.dylib', '.sh', '.py', '.rb'}
+    for fpath in extracted:
+        ext = os.path.splitext(fpath)[1].lower()
+        if ext in exe_extensions:
+            result["executables"].append(fpath)
+        else:
+            # Check magic bytes
+            try:
+                with open(fpath, "rb") as f:
+                    magic = f.read(4)
+                if magic[:2] == b"MZ" or magic[:4] == b"\x7fELF":
+                    result["executables"].append(fpath)
+            except:
+                pass
+
+    # Sort executables by size (bigger = more likely to be the main payload)
+    result["executables"].sort(key=lambda x: os.path.getsize(x) if os.path.exists(x) else 0, reverse=True)
+
+    # Detect Node.js/Electron projects — find and prioritize main JS files
+    js_projects = []
+    for fpath in extracted:
+        if fpath.endswith('package.json'):
+            try:
+                import json as _json
+                with open(fpath) as pf:
+                    pkg = _json.load(pf)
+                project_dir = os.path.dirname(fpath)
+                main_file = pkg.get('main', '')
+                is_electron = 'electron' in str(pkg.get('dependencies', {})) or 'electron' in str(pkg.get('devDependencies', {}))
+                if main_file:
+                    main_path = os.path.join(project_dir, main_file)
+                    if os.path.exists(main_path):
+                        js_projects.append({
+                            "project_dir": project_dir,
+                            "package_name": pkg.get("name", "unknown"),
+                            "package_version": pkg.get("version", "unknown"),
+                            "main_file": main_path,
+                            "main_size": os.path.getsize(main_path),
+                            "is_electron": is_electron,
+                            "dependencies": list(pkg.get("dependencies", {}).keys()),
+                            "description": pkg.get("description", ""),
+                        })
+            except Exception:
+                pass
+
+    if js_projects:
+        result["js_projects"] = js_projects
+        # Add main JS files as "executables" for analysis
+        for proj in js_projects:
+            main_path = proj["main_file"]
+            if main_path not in result["executables"]:
+                result["executables"].insert(0, main_path)
+        print(f"  [archive] Found {len(js_projects)} Node.js/Electron project(s)", flush=True)
+
+    # Find license/crack related files
+    license_files = []
+    for fpath in extracted:
+        fname_lower = os.path.basename(fpath).lower()
+        if any(kw in fname_lower for kw in ['license', 'crack', 'patch', 'keygen', 'activ', 'serial', 'reg']):
+            try:
+                license_files.append({
+                    "path": fpath,
+                    "size": os.path.getsize(fpath),
+                    "content_preview": open(fpath, 'r', errors='replace').read(2000)
+                })
+            except:
+                license_files.append({"path": fpath, "size": os.path.getsize(fpath)})
+    if license_files:
+        result["license_files"] = license_files[:10]
+
+    print(f"  [archive] Found {len(result['executables'])} executables", flush=True)
+    return result
+
+
+def simulate_installer(filepath, output_dir):
+    """Run installer with Wine in silent mode, capture installed files."""
+    result = {"simulated": False, "installed_files": [], "error": None}
+
+    wine_prefix = os.path.join(output_dir, "wineprefix")
+    install_dir = os.path.join(output_dir, "installed")
+    os.makedirs(install_dir, exist_ok=True)
+
+    env = f"WINEPREFIX={wine_prefix} WINEDEBUG=-all DISPLAY=:99"
+
+    # Try common silent install switches
+    silent_switches = [
+        "/SILENT", "/VERYSILENT", "/S", "/quiet", "/qn",
+        "/norestart", "/accepteula", "/install",
+        "--silent", "--quiet", "-q", "-s"
+    ]
+
+    # Snapshot wine prefix before
+    before_files = set()
+    if os.path.exists(wine_prefix):
+        for root, dirs, files in os.walk(wine_prefix):
+            for f in files:
+                before_files.add(os.path.join(root, f))
+
+    # Run installer with Wine
+    print(f"  [installer] Running with Wine (silent mode)...", flush=True)
+    for switch in silent_switches[:3]:  # Try first 3 switches
+        out, err, rc = run_cmd(
+            f"{env} timeout 60 wine '{filepath}' {switch}",
+            timeout=70
+        )
+        if rc == 0:
+            print(f"  [installer] Ran with switch {switch}", flush=True)
+            break
+
+    # Also try without switches
+    out, err, rc = run_cmd(f"{env} timeout 30 wine '{filepath}'", timeout=35)
+
+    # Collect new files
+    after_files = set()
+    if os.path.exists(wine_prefix):
+        for root, dirs, files in os.walk(wine_prefix):
+            for f in files:
+                after_files.add(os.path.join(root, f))
+
+    new_files = after_files - before_files
+    result["installed_files"] = list(new_files)
+    result["simulated"] = len(new_files) > 0
+
+    print(f"  [installer] {len(new_files)} new files created", flush=True)
+    return result
+
+
+def analyze_extracted_file(filepath, index):
+    """Analyze a single extracted file — returns child analysis dict."""
+    import magic
+
+    try:
+        mime = magic.from_file(filepath, mime=True)
+        ftype = magic.from_file(filepath)
+    except:
+        mime = "unknown"
+        ftype = "unknown"
+
+    fname = os.path.basename(filepath)
+    fsize = os.path.getsize(filepath) if os.path.exists(filepath) else 0
+
+    child = {
+        "index": index,
+        "filename": fname,
+        "path": filepath,
+        "size": fsize,
+        "type": ftype,
+        "mime": mime,
+        "results": {}
+    }
+
+    # Get strings
+    out, _, _ = run_cmd(f"strings -n 8 '{filepath}' | head -500")
+    child["strings_sample"] = out[:3000]
+
+    # Detect if it's a binary
+    if mime and ("executable" in mime or "sharedlib" in mime or "x-executable" in mime or "octet-stream" in mime):
+        # PE check
+        with open(filepath, "rb") as f:
+            magic_bytes = f.read(4)
+
+        if magic_bytes[:2] == b"MZ":
+            child["file_type"] = "PE"
+            child["results"]["binary"] = analyze_pe_deep(filepath, {})
+
+            # Check .NET
+            if child["results"]["binary"].get("dotnet"):
+                print(f"    [child] .NET payload found: {fname}", flush=True)
+                child["results"]["dotnet"] = analyze_dotnet_deep(filepath, {})
+
+        elif magic_bytes[:4] == b"\x7fELF":
+            child["file_type"] = "ELF"
+            child["results"]["binary"] = analyze_elf_deep(filepath, {})
+
+        # Ghidra for interesting binaries
+        if fsize > 10_000 and fsize < 50_000_000:
+            try:
+                child["results"]["ghidra"] = run_ghidra_decompile(filepath, {})
+            except:
+                pass
+
+    elif fname.endswith((".config", ".xml", ".json", ".ini", ".cfg", ".yaml")):
+        child["file_type"] = "config"
+        try:
+            with open(filepath, "r", errors="ignore") as f:
+                child["content"] = f.read(10000)
+        except:
+            pass
+
+    elif fname.endswith((".bat", ".cmd", ".ps1", ".vbs", ".js", ".py", ".sh")):
+        child["file_type"] = "script"
+        try:
+            with open(filepath, "r", errors="ignore") as f:
+                child["content"] = f.read(20000)
+        except:
+            pass
+
+    return child
+
+
+def main():
+    """Main worker loop — watch for new tasks."""
+    print("ReTool Worker started. Watching for tasks...", flush=True)
+    print(f"  INPUT_DIR: {INPUT_DIR}", flush=True)
+    print(f"  OUTPUT_DIR: {OUTPUT_DIR}", flush=True)
+    INPUT_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    heartbeat = 0
+    while True:
+        try:
+            tasks = list(INPUT_DIR.glob("*.json"))
+            if tasks:
+                for task_file in tasks:
+                    print(f"Processing: {task_file.name}", flush=True)
+                    try:
+                        result = process_task(str(task_file))
+                        print(f"Done: {result['id']} — {result['status']}", flush=True)
+                    except Exception as e:
+                        print(f"Error processing {task_file}: {e}", flush=True)
+                        traceback.print_exc()
+            else:
+                heartbeat += 1
+                if heartbeat >= 15:  # Every 30 seconds
+                    # List what's in input dir for debugging
+                    all_files = list(INPUT_DIR.iterdir())
+                    print(f"[heartbeat] No tasks. Input dir has {len(all_files)} files: {[f.name for f in all_files[:5]]}", flush=True)
+                    heartbeat = 0
+        except Exception as e:
+            print(f"Worker error: {e}", flush=True)
+            traceback.print_exc()
+
+        time.sleep(2)
+
+
+if __name__ == "__main__":
+    main()
