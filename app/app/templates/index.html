@@ -393,6 +393,16 @@ function AnalysisDetail({ id, nav, addToast }) {
   const [selectedSrcFile, setSelectedSrcFile] = useState(0);
   const [polling, setPolling] = useState(false);
 
+  // Source browser state
+  const [srcTree, setSrcTree] = useState([]);
+  const [srcTreePath, setSrcTreePath] = useState('');
+  const [srcFilePath, setSrcFilePath] = useState('');
+  const [srcFileContent, setSrcFileContent] = useState(null);
+  const [srcFileLoading, setSrcFileLoading] = useState(false);
+  const [srcFunctions, setSrcFunctions] = useState(null);
+  const [srcBreadcrumbs, setSrcBreadcrumbs] = useState([]);
+  const [srcSidebarTab, setSrcSidebarTab] = useState('tree'); // 'tree' | 'functions'
+
   const load = async () => {
     setLoading(true);
     try {
@@ -409,6 +419,62 @@ function AnalysisDetail({ id, nav, addToast }) {
   };
 
   useEffect(() => { load(); }, [id]);
+
+  // Source browser functions
+  const loadSrcTree = async (path = '') => {
+    try {
+      const resp = await fetch(`/api/source/${id}/tree?path=${encodeURIComponent(path)}`);
+      const data = await resp.json();
+      // Sort: directories first, then files
+      const entries = (data.entries || []).sort((a, b) => {
+        if (a.is_dir && !b.is_dir) return -1;
+        if (!a.is_dir && b.is_dir) return 1;
+        return a.name.localeCompare(b.name);
+      });
+      setSrcTree(entries);
+      setSrcTreePath(path);
+      // Update breadcrumbs
+      if (path) {
+        const parts = path.split('/').filter(Boolean);
+        const crumbs = [{ name: 'Root', path: '' }];
+        parts.forEach((p, i) => {
+          crumbs.push({ name: p, path: parts.slice(0, i + 1).join('/') });
+        });
+        setSrcBreadcrumbs(crumbs);
+      } else {
+        setSrcBreadcrumbs([{ name: 'Root', path: '' }]);
+      }
+    } catch(e) { console.error('Failed to load tree', e); }
+  };
+
+  const loadSrcFile = async (filePath) => {
+    setSrcFileLoading(true);
+    setSrcFilePath(filePath);
+    setSrcFunctions(null);
+    try {
+      const resp = await fetch(`/api/source/${id}/file?path=${encodeURIComponent(filePath)}`);
+      const data = await resp.json();
+      setSrcFileContent(data);
+      // Also load functions for JS files
+      if (filePath.endsWith('.js')) {
+        try {
+          const fnResp = await fetch(`/api/source/${id}/functions?path=${encodeURIComponent(filePath)}`);
+          const fnData = await fnResp.json();
+          if (fnData.functions) setSrcFunctions(fnData);
+        } catch(e) {}
+      }
+    } catch(e) {
+      setSrcFileContent({ error: 'Failed to load file' });
+    }
+    setSrcFileLoading(false);
+  };
+
+  // Load tree when switching to source tab (for ZIP/archive files)
+  useEffect(() => {
+    if (tab === 'source' && data && data.file_type === 'ZIP' && _wr.extraction) {
+      loadSrcTree('');
+    }
+  }, [tab, data]);
 
   // Auto-poll when analyzing
   useEffect(() => {
@@ -899,8 +965,150 @@ function AnalysisDetail({ id, nav, addToast }) {
         {/* Source Code */}
         {tab === 'source' && (
           <div className="space-y-6">
-            {/* .NET Decompiled Source */}
-            {dotnetDecompiled && dotnetSourceFiles.length > 0 ? (
+            {/* Source Browser — for ZIP/Archive/JS files */}
+            {_wr.extraction && srcTree.length > 0 || srcFilePath ? (
+              <div className="flex flex-col lg:flex-row gap-3" style={{minHeight:'600px'}}>
+                {/* Left sidebar — Tree + Functions */}
+                <div className="lg:w-72 flex-shrink-0 space-y-2">
+                  {/* Sidebar tabs */}
+                  <div className="flex gap-1 mb-2">
+                    <button onClick={() => setSrcSidebarTab('tree')}
+                      className={`px-3 py-1.5 text-xs rounded-t font-semibold ${srcSidebarTab==='tree' ? 'bg-slate-800 text-indigo-400' : 'bg-slate-900 text-slate-500 hover:text-slate-300'}`}>
+                      📁 Files
+                    </button>
+                    <button onClick={() => setSrcSidebarTab('functions')}
+                      className={`px-3 py-1.5 text-xs rounded-t font-semibold ${srcSidebarTab==='functions' ? 'bg-slate-800 text-green-400' : 'bg-slate-900 text-slate-500 hover:text-slate-300'}`}>
+                      ⚡ Functions {srcFunctions ? `(${srcFunctions.functions?.length || 0})` : ''}
+                    </button>
+                  </div>
+
+                  {srcSidebarTab === 'tree' ? (
+                    /* Directory Tree */
+                    <div className="bg-slate-900 rounded-lg max-h-[600px] overflow-y-auto border border-slate-700">
+                      {/* Breadcrumbs */}
+                      <div className="px-3 py-2 border-b border-slate-700 flex flex-wrap gap-1 text-xs">
+                        {srcBreadcrumbs.map((crumb, i) => (
+                          <span key={i}>
+                            {i > 0 && <span className="text-slate-600 mx-0.5">/</span>}
+                            <button onClick={() => loadSrcTree(crumb.path)}
+                              className="text-indigo-400 hover:text-indigo-300 hover:underline">
+                              {crumb.name}
+                            </button>
+                          </span>
+                        ))}
+                      </div>
+                      {/* Back button */}
+                      {srcTreePath && (
+                        <button onClick={() => {
+                          const parts = srcTreePath.split('/').filter(Boolean);
+                          parts.pop();
+                          loadSrcTree(parts.join('/'));
+                        }}
+                          className="w-full text-left px-3 py-2 text-xs text-slate-500 hover:bg-slate-800 border-b border-slate-800">
+                          ⬆️ ..
+                        </button>
+                      )}
+                      {/* Entries */}
+                      {srcTree.map((entry, i) => (
+                        <button key={i}
+                          onClick={() => entry.is_dir ? loadSrcTree(entry.path) : loadSrcFile(entry.path)}
+                          className={`w-full text-left px-3 py-2 text-xs font-mono border-b border-slate-800 transition-colors flex items-center gap-2 ${
+                            srcFilePath === entry.path ? 'bg-indigo-600/20 text-indigo-300' : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+                          }`}>
+                          <span className="flex-shrink-0">{entry.is_dir ? '📁' : (entry.ext === '.js' ? '📜' : entry.ext === '.json' ? '📋' : '📄')}</span>
+                          <span className="truncate flex-1">{entry.name}</span>
+                          {!entry.is_dir && <span className="text-slate-600 text-[10px] flex-shrink-0">{entry.size > 1024*1024 ? (entry.size/1024/1024).toFixed(1)+'MB' : entry.size > 1024 ? (entry.size/1024).toFixed(1)+'KB' : entry.size+'B'}</span>}
+                        </button>
+                      ))}
+                    </div>
+                  ) : (
+                    /* Functions List */
+                    <div className="bg-slate-900 rounded-lg max-h-[600px] overflow-y-auto border border-slate-700">
+                      {srcFunctions && srcFunctions.functions ? (
+                        <div>
+                          <div className="px-3 py-2 border-b border-slate-700 text-xs text-slate-400">
+                            {srcFunctions.functions.length} functions • {srcFunctions.lines} lines
+                          </div>
+                          {srcFunctions.functions.map((fn, i) => (
+                            <button key={i}
+                              onClick={() => {
+                                // Scroll to line in code viewer
+                                const el = document.getElementById(`src-line-${fn.line}`);
+                                if (el) { el.scrollIntoView({behavior:'smooth',block:'center'}); el.classList.add('bg-yellow-900/30'); setTimeout(()=>el.classList.remove('bg-yellow-900/30'),2000); }
+                              }}
+                              className="w-full text-left px-3 py-1.5 text-xs font-mono border-b border-slate-800 hover:bg-slate-800">
+                              <span className="text-slate-600 text-[10px] w-10 inline-block">L{fn.line}</span>
+                              {fn.async && <span className="text-yellow-400">async </span>}
+                              <span className="text-green-300">{fn.name}</span>
+                              <span className="text-slate-600">({(fn.params||'').slice(0,25)})</span>
+                            </button>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="p-4 text-slate-500 text-xs">Select a .js file to see functions</div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Quick stats */}
+                  {srcFunctions && (
+                    <div className="bg-slate-900 rounded-lg p-3 border border-slate-700 text-xs space-y-1">
+                      <div className="text-slate-400">📊 Quick Stats</div>
+                      <div className="grid grid-cols-2 gap-1">
+                        <div className="text-green-400">⚡ {srcFunctions.functions?.length || 0} funcs</div>
+                        <div className="text-cyan-400">🌐 {srcFunctions.http_routes?.length || 0} routes</div>
+                        <div className="text-purple-400">📡 {srcFunctions.ipc_handlers?.length || 0} IPC</div>
+                        <div className="text-red-400">🔐 {srcFunctions.crypto_ops?.length || 0} crypto</div>
+                        <div className="text-orange-400">🔑 {srcFunctions.api_keys?.length || 0} secrets</div>
+                        <div className="text-yellow-400">⚠️ {srcFunctions.suspicious?.length || 0} suspect</div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* Right — Code Viewer */}
+                <div className="flex-1 min-w-0">
+                  {srcFileLoading ? (
+                    <div className="flex items-center justify-center h-64 text-slate-500">
+                      <div className="animate-spin w-6 h-6 border-2 border-indigo-500 border-t-transparent rounded-full mr-2"></div>
+                      Loading...
+                    </div>
+                  ) : srcFileContent && !srcFileContent.error ? (
+                    <div>
+                      {/* File header */}
+                      <div className="flex items-center justify-between mb-2 bg-slate-900 rounded-lg px-4 py-2 border border-slate-700">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span className="text-indigo-400 font-mono text-sm truncate">{srcFilePath}</span>
+                          <span className="text-slate-500 text-xs flex-shrink-0">{srcFileContent.lines} lines</span>
+                          <span className="text-slate-600 text-xs flex-shrink-0">{(srcFileContent.size/1024).toFixed(1)} KB</span>
+                        </div>
+                        <button onClick={() => { setSrcFileContent(null); setSrcFilePath(''); setSrcFunctions(null); }}
+                          className="text-slate-500 hover:text-slate-300 text-xs flex-shrink-0">✕</button>
+                      </div>
+                      {/* Code */}
+                      <pre className="bg-slate-900 rounded-lg p-4 text-sm text-slate-300 overflow-auto max-h-[650px] font-mono whitespace-pre leading-relaxed border border-slate-700">
+                        {srcFileContent.content.split('\n').map((line, i) => (
+                          <div key={i} id={`src-line-${i+1}`}
+                            className="flex hover:bg-slate-800/50 transition-colors">
+                            <span className="text-slate-600 w-12 text-right pr-3 select-none flex-shrink-0 text-[11px]">{i+1}</span>
+                            <span className="flex-1 break-all">{line}</span>
+                          </div>
+                        ))}
+                      </pre>
+                    </div>
+                  ) : srcFileContent && srcFileContent.error ? (
+                    <div className="flex items-center justify-center h-64 text-red-400">{srcFileContent.error}</div>
+                  ) : (
+                    <div className="flex flex-col items-center justify-center h-64 text-slate-500">
+                      <span className="text-4xl mb-3">📂</span>
+                      <span>Select a file from the tree to view source code</span>
+                      <span className="text-xs mt-1 text-slate-600">JS files show function list automatically</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+            ) : _dotnet.decompiled && dotnetSourceFiles.length > 0 ? (
+              /* .NET Decompiled Source */
               <div>
                 <div className="flex flex-wrap items-center gap-3 mb-4">
                   <h3 className="text-lg font-semibold text-white">💻 Mã nguồn C# (ILSpy Decompiled)</h3>
@@ -908,8 +1116,6 @@ function AnalysisDetail({ id, nav, addToast }) {
                     {_dotnet.total_cs_files || dotnetSourceFiles.length} files • {_dotnet.total_lines || '?'} dòng
                   </span>
                 </div>
-
-                {/* Namespaces & Classes */}
                 {dotnetNamespaces.length > 0 && (
                   <div className="mb-4">
                     <p className="text-sm text-slate-400 mb-1">📦 Namespaces:</p>
@@ -920,31 +1126,21 @@ function AnalysisDetail({ id, nav, addToast }) {
                     </div>
                   </div>
                 )}
-
-                {/* File selector + code viewer */}
                 <div className="flex flex-col lg:flex-row gap-3">
-                  {/* File list sidebar */}
                   <div className="lg:w-64 flex-shrink-0">
                     <p className="text-sm text-slate-400 mb-2">📁 Files ({dotnetSourceFiles.length}):</p>
                     <div className="bg-slate-900 rounded-lg max-h-[600px] overflow-y-auto">
                       {dotnetSourceFiles.map((sf, i) => (
-                        <button
-                          key={i}
-                          onClick={() => setSelectedSrcFile(i)}
+                        <button key={i} onClick={() => setSelectedSrcFile(i)}
                           className={`w-full text-left px-3 py-2 text-xs font-mono border-b border-slate-800 transition-colors ${
-                            selectedSrcFile === i
-                              ? 'bg-indigo-600/20 text-indigo-300'
-                              : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
-                          }`}
-                        >
+                            selectedSrcFile === i ? 'bg-indigo-600/20 text-indigo-300' : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+                          }`}>
                           <div className="truncate">{sf.path}</div>
                           <div className="text-slate-600 text-[10px]">{sf.lines} lines</div>
                         </button>
                       ))}
                     </div>
                   </div>
-
-                  {/* Code viewer */}
                   <div className="flex-1 min-w-0">
                     {dotnetSourceFiles[selectedSrcFile] && (
                       <div>
@@ -965,134 +1161,21 @@ function AnalysisDetail({ id, nav, addToast }) {
                   </div>
                 </div>
               </div>
-            ) : _dotnet.error ? (
-              <div className="bg-red-900/20 border border-red-500/30 rounded-xl p-4">
-                <p className="text-red-400 font-semibold">❌ Lỗi decompile .NET</p>
-                <p className="text-red-300 text-sm mt-1">{_dotnet.error}</p>
+            ) : _results.ghidra && (_results.ghidra.decompiled || _results.ghidra.functions) ? (
+              /* Ghidra Results */
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-3">🔧 Ghidra Analysis</h3>
+                <p className="text-slate-400 text-sm">Ghidra decompiled functions shown in report tab.</p>
               </div>
             ) : (
-              <>
-                {/* Ghidra Results — Native Binary */}
-                {(() => {
-                  const _ghidra = _results.ghidra || {};
-                  const ghidraDecompiled = Array.isArray(_ghidra.decompiled) ? _ghidra.decompiled : [];
-                  const interesting = _ghidra.interesting_functions || {};
-                  const ghidraFunctions = Array.isArray(_ghidra.functions) ? _ghidra.functions : [];
-                  const totalFuncs = _ghidra.total_functions || ghidraFunctions.length;
-
-                  if (ghidraDecompiled.length > 0 || ghidraFunctions.length > 0) {
-                    return (
-                      <div className="space-y-6">
-                        {/* Stats */}
-                        <div className="flex flex-wrap gap-3">
-                          <span className="px-3 py-1 bg-indigo-600/20 text-indigo-300 rounded-full text-sm">
-                            🔧 {totalFuncs} functions total
-                          </span>
-                          <span className="px-3 py-1 bg-green-600/20 text-green-300 rounded-full text-sm">
-                            💻 {ghidraDecompiled.length} decompiled
-                          </span>
-                          {_ghidra.entry_point && (
-                            <span className="px-3 py-1 bg-yellow-600/20 text-yellow-300 rounded-full text-sm">
-                              📍 Entry: {_ghidra.entry_point}
-                            </span>
-                          )}
-                        </div>
-
-                        {/* Interesting Functions */}
-                        {Object.keys(interesting).length > 0 && (
-                          <div>
-                            <h3 className="text-lg font-semibold text-white mb-3">🎯 Interesting Functions</h3>
-                            <div className="space-y-3">
-                              {Object.entries(interesting).map(([cat, funcs]) => (
-                                <div key={cat} className="bg-slate-900 rounded-lg p-4">
-                                  <p className="text-sm font-semibold text-indigo-400 mb-2">
-                                    {cat === 'crypto' && '🔐'} {cat === 'network' && '🌐'} {cat === 'file_io' && '📁'}
-                                    {cat === 'registry' && '📋'} {cat === 'process_injection' && '💉'} {cat === 'anti_debug' && '🛡️'}
-                                    {' '}{cat.replace('_', ' ')} ({funcs.length})
-                                  </p>
-                                  <div className="grid md:grid-cols-2 gap-1">
-                                    {funcs.slice(0, 10).map((f, fi) => (
-                                      <div key={fi} className="text-xs font-mono text-slate-300 bg-slate-800 rounded px-2 py-1">
-                                        {f.name} <span className="text-slate-500">@ {f.address}</span>
-                                        {f.callees && f.callees.length > 0 && (
-                                          <span className="text-slate-600"> → {f.callees.slice(0, 3).join(', ')}</span>
-                                        )}
-                                      </div>
-                                    ))}
-                                  </div>
-                                </div>
-                              ))}
-                            </div>
-                          </div>
-                        )}
-
-                        {/* Decompiled Functions */}
-                        {ghidraDecompiled.length > 0 && (
-                          <div>
-                            <h3 className="text-lg font-semibold text-white mb-3">💻 Decompiled Code ({ghidraDecompiled.length} functions)</h3>
-                            <div className="space-y-3">
-                              {ghidraDecompiled.slice(0, 50).map((f, fi) => (
-                                <details key={fi} className="bg-slate-900 rounded-lg border border-slate-700">
-                                  <summary className="px-4 py-2 cursor-pointer hover:bg-slate-800 rounded-lg flex items-center justify-between">
-                                    <span className="text-indigo-400 font-mono text-sm">{f.name}</span>
-                                    <div className="flex items-center gap-2">
-                                      <span className="text-slate-500 text-xs">{f.size} bytes</span>
-                                      <span className="text-slate-600 text-xs">@ {f.address}</span>
-                                    </div>
-                                  </summary>
-                                  {f.code && (
-                                    <pre className="px-4 pb-3 text-sm text-slate-300 overflow-auto max-h-[400px] font-mono whitespace-pre leading-relaxed border-t border-slate-700 pt-2">
-                                      {f.code.split('\n').map((line, li) => (
-                                        <div key={li} className="flex hover:bg-slate-800/50">
-                                          <span className="text-slate-600 w-10 text-right pr-3 select-none flex-shrink-0">{li+1}</span>
-                                          <span className="flex-1">{line}</span>
-                                        </div>
-                                      ))}
-                                    </pre>
-                                  )}
-                                </details>
-                              ))}
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    );
-                  }
-
-                  // Fallback: legacy decompiled view
-                  return (
-                    <>
-                      {keyFunctions.length > 0 && (
-                        <div>
-                          <h3 className="text-lg font-semibold text-white mb-3">⚡ Hàm chính</h3>
-                          <div className="grid md:grid-cols-2 gap-2">
-                            {keyFunctions.map((f,i) => (
-                              <div key={i} className="bg-slate-900 rounded-lg px-4 py-2 text-sm">
-                                <span className="text-indigo-400 font-mono">{typeof f==='string'?f:f.name||JSON.stringify(f)}</span>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-                      <div>
-                        <h3 className="text-lg font-semibold text-white mb-3">💻 Mã nguồn (Decompiled)</h3>
-                        {decompiled ? (
-                          <pre className="bg-slate-900 rounded-lg p-4 text-sm text-slate-300 overflow-auto max-h-[500px] font-mono whitespace-pre-wrap leading-relaxed">
-                            {decompiled.split('\n').map((line, i) => (
-                              <div key={i} className="flex"><span className="text-slate-600 w-10 text-right pr-3 select-none flex-shrink-0">{i+1}</span><span className="flex-1">{line}</span></div>
-                            ))}
-                          </pre>
-                        ) : <p className="text-slate-500">Không có mã nguồn</p>}
-                      </div>
-                    </>
-                  );
-                })()}
-              </>
+              <div className="flex flex-col items-center justify-center h-64 text-slate-500">
+                <span className="text-4xl mb-3">💻</span>
+                <span>Không có mã nguồn để hiển thị</span>
+                <span className="text-xs mt-1 text-slate-600">Upload .js, .zip, .exe, .NET files to see source</span>
+              </div>
             )}
           </div>
-        )}
-
-        {/* Network */}
+        )}        {/* Network */}
         {tab === 'network' && (
           <div className="space-y-4">
             <h3 className="text-lg font-semibold text-white mb-3">🌐 Hoạt động mạng & Dynamic Analysis</h3>
