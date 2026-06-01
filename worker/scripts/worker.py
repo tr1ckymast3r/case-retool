@@ -935,7 +935,7 @@ def process_task(task_file):
             execs = archive_result.get("executables", [])
             if execs:
                 print(f"  [task] Found {len(execs)} executables in archive", flush=True)
-                for i, exe_path in enumerate(execs[:10]):
+                for i, exe_path in enumerate(execs[:15]):
                     try:
                         child = analyze_extracted_file(exe_path, i)
                         if child:
@@ -1217,12 +1217,17 @@ def handle_archive(filepath, output_dir):
 
     if js_projects:
         result["js_projects"] = js_projects
-        # Add main JS files as "executables" for analysis
+        # Prioritize main JS files — insert at front of executables list
+        main_paths = []
         for proj in js_projects:
             main_path = proj["main_file"]
-            if main_path not in result["executables"]:
-                result["executables"].insert(0, main_path)
+            if main_path not in main_paths:
+                main_paths.append(main_path)
+        # Remove main_paths from executables first, then prepend
+        result["executables"] = [e for e in result["executables"] if e not in main_paths]
+        result["executables"] = main_paths + result["executables"]
         print(f"  [archive] Found {len(js_projects)} Node.js/Electron project(s)", flush=True)
+        print(f"  [archive] Prioritized {len(main_paths)} main JS files for analysis", flush=True)
 
     # Find license/crack related files
     license_files = []
@@ -1366,6 +1371,16 @@ def analyze_extracted_file(filepath, index):
                 child["content"] = f.read(20000)
         except:
             pass
+        # Deep JS analysis for JavaScript files
+        if fname.endswith('.js') and fsize > 500:
+            try:
+                from js_analyzer import analyze_js_deep
+                js_result = analyze_js_deep(filepath)
+                child["results"]["js_analysis"] = js_result
+                child["file_type"] = "javascript"
+                print(f"    [child] JS deep analysis: {js_result.get('summary', '')}", flush=True)
+            except Exception as e:
+                print(f"    [child] JS analysis error: {e}", flush=True)
 
     return child
 
